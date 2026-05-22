@@ -12,7 +12,7 @@ relay_backend: shm
 runtime_overrides:
   thinker:
     server_args_overrides:
-      max_running_requests: 1
+      max_running_requests: 4
 
 stage_overrides:
   image_encoder:

@@ -166,7 +166,7 @@ def test_qwen3_omni_mmsu_example_config_uses_text_pipeline() -> None:
     assert "code2wav" not in {stage.name for stage in config.stages}
     assert plan.gpus[0].total_gpu_memory_fraction == pytest.approx(0.8)
     assert thinker_args["total_gpu_memory_fraction"] == pytest.approx(0.75)
-    assert thinker_args["server_args_overrides"]["max_running_requests"] == 1
+    assert thinker_args["server_args_overrides"]["max_running_requests"] == 4
 
 
 def test_qwen_preprocessing_runtime_video_fps_resolves_to_factory_arg() -> None:
