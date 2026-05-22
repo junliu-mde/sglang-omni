@@ -69,6 +69,7 @@ class RouterWorkerTrafficGuard:
                 port=self.handle.port,
                 before_snapshot=self.before_snapshot,
                 label=self.label,
+                expected_workers=len(self.handle.worker_ports),
                 min_total_requests=min_total_requests,
             )
         except Exception:
@@ -299,6 +300,7 @@ def assert_workers_served_requests_since(
     port: int,
     before_snapshot: dict,
     label: str,
+    expected_workers: int = 2,
     min_total_requests: int | None = None,
 ) -> None:
     delta_snapshot = _worker_request_delta(
@@ -308,6 +310,7 @@ def assert_workers_served_requests_since(
     print_worker_snapshot(f"{label} /workers delta", delta_snapshot)
     assert_workers_served_requests(
         delta_snapshot,
+        expected_workers=expected_workers,
         min_total_requests=min_total_requests,
     )
 
