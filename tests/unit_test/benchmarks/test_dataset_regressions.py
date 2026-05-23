@@ -60,7 +60,7 @@ def test_download_dataset_prewarms_all_mmmu_configs(monkeypatch) -> None:
     ]
 
 
-def test_load_seedtts_samples_rejects_local_meta_lst(tmp_path: Path) -> None:
+def test_load_seedtts_samples_accepts_local_meta_lst(tmp_path: Path) -> None:
     meta_dir = tmp_path / "en"
     meta_dir.mkdir()
     ref_audio = meta_dir / "ref.wav"
@@ -70,8 +70,13 @@ def test_load_seedtts_samples_rejects_local_meta_lst(tmp_path: Path) -> None:
         "sample-1|hello|ref.wav|target one\nsample-2|world|ref.wav|target two\n"
     )
 
-    with pytest.raises(ValueError, match="no longer supported"):
-        seedtts.load_seedtts_samples(str(meta_path), max_samples=1)
+    samples = seedtts.load_seedtts_samples(str(meta_path), max_samples=1)
+
+    assert len(samples) == 1
+    assert samples[0].sample_id == "sample-1"
+    assert samples[0].ref_text == "hello"
+    assert samples[0].ref_audio == str(ref_audio)
+    assert samples[0].target_text == "target one"
 
 
 def test_load_seedtts_samples_stages_only_selected_rows(
@@ -185,8 +190,7 @@ def test_load_seedtts_samples_rejects_unsafe_audio_paths(
 
 def test_tune_ci_threshold_configs_use_arrow_seedtts_datasets() -> None:
     models_dir = (
-        Path(__file__).resolve().parents[3]
-        / ".claude/skills/tune-ci-thresholds/models"
+        Path(__file__).resolve().parents[3] / ".claude/skills/tune-ci-thresholds/models"
     )
 
     for config_path in sorted(models_dir.glob("*/config.yaml")):
@@ -194,6 +198,6 @@ def test_tune_ci_threshold_configs_use_arrow_seedtts_datasets() -> None:
         for repo_id in config.get("hf_datasets", []):
             if "seed-tts" not in repo_id:
                 continue
-            assert repo_id.endswith("-arrow"), (
-                f"{config_path} still points to a non-arrow SeedTTS dataset: {repo_id}"
-            )
+            assert repo_id.endswith(
+                "-arrow"
+            ), f"{config_path} still points to a non-arrow SeedTTS dataset: {repo_id}"

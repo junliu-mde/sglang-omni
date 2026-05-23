@@ -360,7 +360,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         dest="meta",
         type=str,
         default="zhaochenyang20/seed-tts-eval-arrow",
-        help="HuggingFace Arrow/Parquet dataset repo id.",
+        help="HuggingFace Arrow/Parquet dataset repo id or local meta.lst path.",
     )
     parser.add_argument(
         "--no-ref-audio",

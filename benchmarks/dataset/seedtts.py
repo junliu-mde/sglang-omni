@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SeedTTS dataset loader for HuggingFace Arrow/Parquet repos.
+"""SeedTTS dataset loader for local meta.lst and HuggingFace Arrow/Parquet repos.
 
 Audio bytes are staged to a process-scoped temporary directory so downstream
-consumers (which expect filesystem paths) work unchanged.
+consumers (which expect filesystem paths) work unchanged for Arrow/Parquet
+sources. Local meta.lst files already point at local audio paths.
 """
 
 from __future__ import annotations
@@ -82,17 +83,43 @@ def load_seedtts_samples(
 ) -> list[SampleInput]:
     """Load SeedTTS evaluation samples.
 
-    *source* must be a HuggingFace dataset repo id (e.g.
-    ``zhaochenyang20/seed-tts-eval-50-arrow``). The dataset is fetched via
-    ``datasets.load_dataset`` and audio bytes are staged to a temporary
-    directory.
+    *source* may be either a local ``meta.lst`` file in seed-tts-eval format or
+    a HuggingFace dataset repo id (e.g.
+    ``zhaochenyang20/seed-tts-eval-50-arrow``). Arrow/Parquet datasets are
+    fetched via ``datasets.load_dataset`` and audio bytes are staged to a
+    temporary directory.
     """
     if os.path.isfile(source) or source.endswith(".lst"):
-        raise ValueError(
-            "Local SeedTTS meta.lst files are no longer supported. "
-            "Pass a HuggingFace Arrow/Parquet dataset repo id instead."
-        )
+        return _load_from_meta_lst(source, max_samples)
     return _load_from_arrow(source, split, max_samples)
+
+
+def _load_from_meta_lst(path: str, max_samples: int | None) -> list[SampleInput]:
+    """Parse a local seed-tts-eval meta.lst file."""
+    if max_samples is not None and max_samples <= 0:
+        return []
+
+    base_dir = os.path.dirname(path)
+    samples: list[SampleInput] = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("|")
+            if len(parts) < 4:
+                continue
+            samples.append(
+                SampleInput(
+                    sample_id=parts[0],
+                    ref_text=parts[1],
+                    ref_audio=os.path.join(base_dir, parts[2]),
+                    target_text=parts[3],
+                )
+            )
+            if max_samples is not None and len(samples) >= max_samples:
+                break
+    return samples
 
 
 def _load_from_arrow(

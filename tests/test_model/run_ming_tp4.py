@@ -111,7 +111,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tts-meta",
         default="zhaochenyang20/seed-tts-eval-arrow",
-        help="HuggingFace Arrow/Parquet dataset repo id.",
+        help="HuggingFace Arrow/Parquet dataset repo id or local meta.lst path.",
     )
     parser.add_argument("--tts-lang", choices=["en", "zh"], default="en")
     parser.add_argument(
