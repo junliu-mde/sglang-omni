@@ -38,11 +38,18 @@ DATASETS: dict[str, str] = {
 
 def download_dataset(repo_id: str, *, quiet: bool = False) -> None:
     """Pre-warm the HuggingFace ``datasets`` cache for *repo_id*."""
-    from datasets import load_dataset
+    from datasets import get_dataset_config_names, load_dataset
 
     if not quiet:
         logger.info(f"Pre-warming HuggingFace cache for {repo_id} ...")
-    load_dataset(repo_id)
+
+    if repo_id == "MMMU/MMMU":
+        config_names = get_dataset_config_names(repo_id)
+        for config_name in config_names:
+            load_dataset(repo_id, config_name, split="validation")
+    else:
+        load_dataset(repo_id)
+
     if not quiet:
         logger.info(f"Dataset {repo_id} cached.")
 
