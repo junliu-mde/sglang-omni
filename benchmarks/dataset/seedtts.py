@@ -21,7 +21,13 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_REQUIRED_COLUMNS = {"sample_id", "ref_text", "ref_audio_path", "target_text", "ref_audio"}
+_REQUIRED_COLUMNS = {
+    "sample_id",
+    "ref_text",
+    "ref_audio_path",
+    "target_text",
+    "ref_audio",
+}
 
 
 @dataclass
@@ -140,6 +146,9 @@ def _load_from_arrow(
     _STAGED_CACHE[cache_key] = samples
     logger.info(
         "Loaded %d samples (%d unique audio files) from %s/%s",
-        len(samples), len(written), repo_id, split,
+        len(samples),
+        len(written),
+        repo_id,
+        split,
     )
     return list(samples)
