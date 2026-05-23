@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SeedTTS dataset loader.
+"""SeedTTS dataset loader for HuggingFace Arrow/Parquet repos.
 
-Supports two source formats:
-- Local ``meta.lst`` files (pipe-delimited: ``id|ref_text|ref_audio_path|target_text``)
-- HuggingFace Arrow/Parquet repos (e.g. ``zhaochenyang20/seed-tts-eval-50-arrow``)
-
-Arrow datasets stage WAV bytes to a process-scoped temporary directory so that
-downstream consumers (which expect filesystem paths) work unchanged.
+Audio bytes are staged to a process-scoped temporary directory so downstream
+consumers (which expect filesystem paths) work unchanged.
 """
 
 from __future__ import annotations
@@ -17,7 +13,7 @@ import os
 import shutil
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +37,43 @@ class SampleInput:
 _STAGED_CACHE: dict[tuple[str, str, int | None], list[SampleInput]] = {}
 
 
+def _resolve_staged_audio_path(
+    staging_root: Path,
+    rel_path: str,
+    *,
+    repo_id: str,
+    split: str,
+    sample_id: str,
+) -> Path:
+    raw_path = rel_path.strip() if isinstance(rel_path, str) else ""
+    error_prefix = (
+        f"Invalid ref_audio_path for {repo_id}/{split}/{sample_id}: {rel_path!r}"
+    )
+    if not raw_path:
+        raise ValueError(f"{error_prefix} (empty path)")
+
+    posix_path = PurePosixPath(raw_path)
+    windows_path = PureWindowsPath(raw_path)
+    if (
+        posix_path.is_absolute()
+        or windows_path.is_absolute()
+        or windows_path.drive
+        or windows_path.root
+    ):
+        raise ValueError(f"{error_prefix} (absolute or anchored path)")
+
+    if ".." in posix_path.parts or ".." in windows_path.parts:
+        raise ValueError(f"{error_prefix} (parent traversal)")
+
+    staging_root = staging_root.resolve()
+    wav_path = (staging_root / Path(raw_path)).resolve()
+    try:
+        wav_path.relative_to(staging_root)
+    except ValueError as exc:
+        raise ValueError(f"{error_prefix} (path escapes staging directory)") from exc
+    return wav_path
+
+
 def load_seedtts_samples(
     source: str,
     max_samples: int | None = None,
@@ -49,39 +82,17 @@ def load_seedtts_samples(
 ) -> list[SampleInput]:
     """Load SeedTTS evaluation samples.
 
-    *source* is either a local ``meta.lst`` file path or a HuggingFace dataset
-    repo id (e.g. ``zhaochenyang20/seed-tts-eval-50-arrow``).  When a repo id
-    is given, the dataset is fetched via ``datasets.load_dataset`` and audio
-    bytes are staged to a temporary directory.
+    *source* must be a HuggingFace dataset repo id (e.g.
+    ``zhaochenyang20/seed-tts-eval-50-arrow``). The dataset is fetched via
+    ``datasets.load_dataset`` and audio bytes are staged to a temporary
+    directory.
     """
     if os.path.isfile(source) or source.endswith(".lst"):
-        return _load_from_meta_lst(source, max_samples)
+        raise ValueError(
+            "Local SeedTTS meta.lst files are no longer supported. "
+            "Pass a HuggingFace Arrow/Parquet dataset repo id instead."
+        )
     return _load_from_arrow(source, split, max_samples)
-
-
-def _load_from_meta_lst(path: str, max_samples: int | None) -> list[SampleInput]:
-    """Legacy loader: parse a pipe-delimited meta.lst file."""
-    base_dir = os.path.dirname(path)
-    samples: list[SampleInput] = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split("|")
-            if len(parts) < 4:
-                continue
-            samples.append(
-                SampleInput(
-                    sample_id=parts[0],
-                    ref_text=parts[1],
-                    ref_audio=os.path.join(base_dir, parts[2]),
-                    target_text=parts[3],
-                )
-            )
-            if max_samples is not None and len(samples) >= max_samples:
-                break
-    return samples
 
 
 def _load_from_arrow(
@@ -118,9 +129,17 @@ def _load_from_arrow(
 
     samples: list[SampleInput] = []
     written: set[str] = set()
+    staging_root = tmpdir.resolve()
 
     for row in ds:
         rel = row["ref_audio_path"]
+        wav_path = _resolve_staged_audio_path(
+            staging_root,
+            rel,
+            repo_id=repo_id,
+            split=split,
+            sample_id=row["sample_id"],
+        )
         audio = row["ref_audio"] or {}
         audio_bytes = audio.get("bytes")
         if not audio_bytes:
@@ -128,11 +147,11 @@ def _load_from_arrow(
                 f"Empty audio bytes for {repo_id}/{split}/{row['sample_id']}"
             )
 
-        wav_path = tmpdir / rel
-        if rel not in written:
+        rel_key = wav_path.relative_to(staging_root).as_posix()
+        if rel_key not in written:
             wav_path.parent.mkdir(parents=True, exist_ok=True)
             wav_path.write_bytes(audio_bytes)
-            written.add(rel)
+            written.add(rel_key)
 
         samples.append(
             SampleInput(

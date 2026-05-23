@@ -15,7 +15,7 @@ name: s2-pro-v1
 description: "FishAudio S2-Pro voice-clone TTS"
 hf_model_id: "fishaudio/s2-pro"
 hf_datasets:
-  - "zhaochenyang20/seed-tts-eval-50"
+  - "zhaochenyang20/seed-tts-eval-50-arrow"
 # Per user override: this host shares the omni-qwen3 venv across all
 # models — there is no separate omni-s2pro venv to check.
 default_venv_python:

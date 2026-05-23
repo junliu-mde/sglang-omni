@@ -334,7 +334,7 @@ def run_seedtts_similarity(
         generated: list[dict] = json.load(f)
     logger.info(f"Loaded {len(generated)} entries from {generated_path}")
 
-    split = getattr(config, "lang", "en")
+    split = config.lang
     ref_audio_by_id = {
         sample.sample_id: sample.ref_audio
         for sample in load_seedtts_samples(config.meta, split=split)
