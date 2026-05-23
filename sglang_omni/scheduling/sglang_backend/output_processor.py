@@ -192,21 +192,25 @@ class SGLangOutputProcessor:
         if tensor.ndim == 0:
             return tensor
 
+        batch_data = scheduler_output.batch_data
+        reqs = getattr(batch_data, "reqs", None) if batch_data is not None else None
+        if reqs is not None:
+            num_requests = len(reqs)
+
+            lengths = [req.extend_input_len for req in reqs]
+            total_tokens = sum(lengths)
+            if tensor.shape[0] == total_tokens:
+                if total_tokens == num_requests:
+                    return tensor[request_index]
+                start = sum(lengths[:request_index])
+                end = start + lengths[request_index]
+                return tensor[start:end]
+
+            if tensor.shape[0] == num_requests:
+                return tensor[request_index]
+
         requests = scheduler_output.requests
         if len(requests) == 1:
             return tensor[0] if tensor.ndim >= 2 else tensor
-
-        batch_data = scheduler_output.batch_data
-        reqs = batch_data.reqs
-        num_requests = len(reqs)
-        if tensor.shape[0] == num_requests:
-            return tensor[request_index]
-
-        lengths = [req.extend_input_len for req in reqs]
-        total_tokens = sum(lengths)
-        if tensor.shape[0] == total_tokens:
-            start = sum(lengths[:request_index])
-            end = start + lengths[request_index]
-            return tensor[start:end]
 
         return tensor

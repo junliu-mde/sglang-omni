@@ -185,6 +185,27 @@ def test_qwen_thinker_stream_builder_keeps_talker_when_modalities_missing():
     assert [msg.target for msg in messages] == ["decode", "talker_ar"]
 
 
+def test_qwen_thinker_stream_builder_carries_prefill_prompt_states():
+    builder = make_thinker_stream_output_builder()
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(is_chunked=0, prefix_indices=torch.tensor([0, 1])),
+        stage_payload=_thinker_stage_payload(["audio"]),
+    )
+    prefill_embed = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    prefill_hidden = torch.arange(30, 36, dtype=torch.float32).reshape(3, 2)
+    req_output = SimpleNamespace(
+        data=11,
+        extra={"hidden_states": {"embed": prefill_embed, 24: prefill_hidden}},
+    )
+
+    messages = builder("req-1", req_data, req_output)
+    talker_msg = [msg for msg in messages if msg.target == "talker_ar"][0]
+
+    assert "prefill_embed" not in talker_msg.metadata
+    assert torch.equal(talker_msg.metadata["prefill_layer_hidden"], prefill_hidden)
+    assert talker_msg.metadata["prefill_offset"] == 2
+
+
 def test_qwen_hidden_states_skip_only_explicit_text_output_requests():
     output_processor = SGLangOutputProcessor(
         capture_hidden=True,
@@ -231,6 +252,47 @@ def test_qwen_hidden_states_skip_only_explicit_text_output_requests():
     assert torch.equal(
         outputs["default"].extra["hidden_states"],
         torch.tensor([5.0, 6.0]),
+    )
+
+
+def test_qwen_aux_hidden_states_keep_single_request_prefill_rows():
+    model = SimpleNamespace(
+        _captured_aux_hidden_states=[
+            torch.arange(8, dtype=torch.float32).reshape(4, 2),
+            torch.arange(40, 48, dtype=torch.float32).reshape(4, 2),
+        ]
+    )
+    output_processor = SGLangOutputProcessor(
+        capture_hidden=True,
+        capture_hidden_layers=[0, 24],
+        model=model,
+        should_emit_hidden=lambda _request: True,
+    )
+    scheduler_output = SchedulerOutput(
+        requests=[SchedulerRequest(request_id="audio")],
+        batch_data=SimpleNamespace(reqs=[SimpleNamespace(extend_input_len=4)]),
+    )
+    model_output = SimpleNamespace(
+        next_token_ids=torch.tensor([11]),
+        logits_output=SimpleNamespace(
+            hidden_states=torch.arange(100, 108, dtype=torch.float32).reshape(4, 2)
+        ),
+    )
+
+    outputs = output_processor.process(model_output, scheduler_output)
+
+    audio_hidden = outputs["audio"].extra["hidden_states"]
+    assert torch.equal(
+        audio_hidden["embed"],
+        torch.arange(8, dtype=torch.float32).reshape(4, 2),
+    )
+    assert torch.equal(
+        audio_hidden[24],
+        torch.arange(40, 48, dtype=torch.float32).reshape(4, 2),
+    )
+    assert torch.equal(
+        outputs["audio"].extra["stream_hidden_states"],
+        torch.arange(100, 108).reshape(4, 2),
     )
 
 
