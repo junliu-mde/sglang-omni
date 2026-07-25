@@ -57,10 +57,11 @@ def test_moss_pipeline_uses_bounded_cpu_threads(
 
     monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
     monkeypatch.setattr(
-        stages.os,
-        "sched_getaffinity",
-        lambda _pid: set(range(cpu_count)),
-        raising=False,
+        stages,
+        "bounded_intraop_threads",
+        lambda *, worker_count, max_threads: min(
+            max(cpu_count // worker_count, 1), max_threads
+        ),
     )
     configured_threads: list[int] = []
     monkeypatch.setattr(stages.torch, "set_num_threads", configured_threads.append)
@@ -434,6 +435,7 @@ def test_pipeline_stage_wiring():
     assert stages["preprocessing"].process == "pipeline"
     assert stages["preprocessing"].gpu == 0
     assert stages["preprocessing"].factory_args["device"] == "cuda:0"
+    assert stages["preprocessing"].factory_args["max_concurrency"] == 16
     assert stages["preprocessing"].factory_args["ref_audio_cache"] is True
     assert stages["preprocessing"].factory_args["ref_audio_cache_max_items"] == 8192
     assert stages[
@@ -483,6 +485,39 @@ def test_pipeline_stage_wiring():
     assert split_runtime.resources.total_gpu_memory_fraction is None
     assert split_runtime.sglang_server_args.mem_fraction_static == pytest.approx(0.85)
     assert split_stages["vocoder"].factory_args["device"] == "cuda:1"
+
+
+@pytest.mark.parametrize(
+    "effective_cpus,expected_threads",
+    [(4, 1), (16, 1), (32, 2), (224, 8)],
+)
+def test_pipeline_sets_spawn_time_omp_default(
+    monkeypatch: pytest.MonkeyPatch,
+    effective_cpus: int,
+    expected_threads: int,
+) -> None:
+    from sglang_omni.models.moss_tts_local import config as config_module
+
+    monkeypatch.setattr(
+        config_module,
+        "bounded_intraop_threads",
+        lambda *, worker_count, max_threads: min(
+            max(effective_cpus // worker_count, 1), max_threads
+        ),
+    )
+
+    config = config_module.MossTTSLocalPipelineConfig(model_path="dummy")
+
+    assert config.env_defaults["OMP_NUM_THREADS"] == str(expected_threads)
+
+
+def test_pipeline_preserves_explicit_omp_default() -> None:
+    config = MossTTSLocalPipelineConfig(
+        model_path="dummy",
+        env_defaults={"OMP_NUM_THREADS": "3"},
+    )
+
+    assert config.env_defaults["OMP_NUM_THREADS"] == "3"
 
 
 def test_pipeline_config_injects_reference_cache_factory_args():
