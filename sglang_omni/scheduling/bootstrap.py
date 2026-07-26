@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 
@@ -17,6 +18,7 @@ def create_sglang_infrastructure(
     capture_hidden_layers: list[int] | None = None,
     total_gpu_memory_fraction: float | None = None,
     defer_cuda_graph_capture: bool = False,
+    before_cuda_graph_init: Callable[[Any], None] | None = None,
 ):
     """Create SGLang worker, memory pools, tree cache, and prefill/decode managers."""
     from sglang_omni.model_runner.model_worker import ModelWorker, ModelWorkerConfig
@@ -53,6 +55,8 @@ def create_sglang_infrastructure(
     model_runner = model_worker.model_runner
     model_runner.alloc_memory_pool()
     model_runner.init_attention_backends()
+    if before_cuda_graph_init is not None:
+        before_cuda_graph_init(model_runner)
 
     if not defer_cuda_graph_capture:
         # This is required even when graphs are disabled: 0.5.15 installs the

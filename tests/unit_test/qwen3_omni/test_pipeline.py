@@ -782,10 +782,19 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     )
     infrastructure_saw_graph_disabled: list[bool] = []
     capture_hidden_layers_seen: list[list[int] | None] = []
+    graph_compat_hooks_seen: list[object] = []
     init_graph_calls = 0
 
     class FakeModelRunner:
         model = object()
+        server_args = SimpleNamespace(
+            enable_pdmux=False,
+            enable_two_batch_overlap=False,
+        )
+        attn_backend = SimpleNamespace(
+            _get_scheduler_metadata=lambda: None,
+            _disable_scheduler_metadata_precompute=False,
+        )
 
         def init_cuda_graphs(self) -> None:
             nonlocal init_graph_calls
@@ -805,6 +814,10 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     def fake_create_infrastructure(*args, **kwargs):
         infrastructure_saw_graph_disabled.append(bool(args[0].disable_cuda_graph))
         capture_hidden_layers_seen.append(kwargs.get("capture_hidden_layers"))
+        graph_compat_hook = kwargs.get("before_cuda_graph_init")
+        graph_compat_hooks_seen.append(graph_compat_hook)
+        assert callable(graph_compat_hook)
+        graph_compat_hook(model_worker.model_runner)
         return (
             model_worker,
             object(),
@@ -852,6 +865,11 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
 
     assert infrastructure_saw_graph_disabled == [expected_infrastructure_graph_disabled]
     assert capture_hidden_layers_seen == [expected_capture_hidden_layers]
+    assert len(graph_compat_hooks_seen) == 1
+    assert (
+        model_worker.model_runner.attn_backend._disable_scheduler_metadata_precompute
+        is True
+    )
     assert init_graph_calls == expected_init_graph_calls
     assert server_args.enable_return_hidden_states is speech_enabled
     assert server_args.disable_cuda_graph is False

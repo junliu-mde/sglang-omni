@@ -3,7 +3,12 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
+
+from sglang_omni.models.qwen3_omni.sglang_compat import (
+    configure_single_stream_fa3_graph_metadata,
+)
 
 
 def create_thinker_scheduler(
@@ -55,6 +60,11 @@ def create_thinker_scheduler(
         capture_hidden_layers=capture_hidden_layers,
         total_gpu_memory_fraction=total_gpu_memory_fraction,
         defer_cuda_graph_capture=defer_cuda_graph_capture,
+        before_cuda_graph_init=(
+            partial(configure_single_stream_fa3_graph_metadata, stage="thinker")
+            if want_cuda_graph
+            else None
+        ),
     )
 
     if defer_cuda_graph_capture:
@@ -157,6 +167,11 @@ def create_talker_scheduler(
         weight_prefix=weight_prefix,
         total_gpu_memory_fraction=total_gpu_memory_fraction,
         defer_cuda_graph_capture=want_cuda_graph,
+        before_cuda_graph_init=(
+            partial(configure_single_stream_fa3_graph_metadata, stage="talker")
+            if want_cuda_graph
+            else None
+        ),
     )
     # Note:(Chenchen Hong) align the talker vocab to the codec vocab: post1 sizes
     # the repetition-penalty orchestrator from model_config.vocab_size (the

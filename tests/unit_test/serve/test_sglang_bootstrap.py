@@ -63,11 +63,18 @@ def test_create_sglang_infrastructure_runs_0515_initialization_phases(
         chunked_prefill_size=8,
         max_prefill_tokens=16,
     )
-    infrastructure = bootstrap.create_sglang_infrastructure(server_args, 0)
+    infrastructure = bootstrap.create_sglang_infrastructure(
+        server_args,
+        0,
+        before_cuda_graph_init=lambda runner: events.append(
+            f"before_cuda_graph_init:{type(runner).__name__}"
+        ),
+    )
 
     assert events == [
         "alloc_memory_pool",
         "init_attention_backends",
+        "before_cuda_graph_init:FakeRunner",
         "init_cuda_graphs",
         "get_memory_pool",
     ]
