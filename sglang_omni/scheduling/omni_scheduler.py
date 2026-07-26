@@ -18,8 +18,10 @@ import queue as _queue_mod
 import threading
 import time
 import types
+from array import array
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from typing import Any, Callable
 
 import torch
@@ -181,9 +183,13 @@ class OmniScheduler:
         self.pp_rank = 0
         self.pp_size = server_args.pp_size
         self.dp_rank = None
-        self.dp_size = 1
+        self.dp_size = getattr(server_args, "dp_size", 1)
         self.moe_ep_rank = 0
         self.moe_ep_size = 1
+        self.moe_dp_rank = None
+        self.moe_dp_size = getattr(server_args, "moe_dp_size", 1)
+        self.attn_cp_rank = 0
+        self.attn_cp_size = getattr(server_args, "attn_cp_size", 1)
         self.page_size = server_args.page_size
         self.enable_overlap = enable_overlap
         # One-step-lookahead async decode (single stream + CUDA event). Only
@@ -224,6 +230,10 @@ class OmniScheduler:
         self.max_req_input_len = self.max_req_len - 1
         self.random_seed = tp_worker.random_seed
         self.device = tp_worker.device
+        self.full_tokens_per_layer = getattr(mr, "full_tokens_per_layer", None)
+        self.swa_tokens_per_layer = getattr(mr, "swa_tokens_per_layer", None)
+        self.min_free_slots_delayer = None
+        self.enable_fpm = False
 
         # Global server_args field upstream sets in its __init__
         from sglang.srt.server_args import get_global_server_args
@@ -269,9 +279,10 @@ class OmniScheduler:
 
         # Chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
-        if self.chunked_prefill_size <= 0:
+        if self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
+        self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
@@ -296,6 +307,13 @@ class OmniScheduler:
         self.schedule_low_priority_values_first = (
             server_args.schedule_low_priority_values_first
         )
+        from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
+            NewTokenRatioTracker,
+        )
+
+        self.new_token_ratio_tracker = NewTokenRatioTracker.from_server_args(
+            server_args
+        )
         self.init_new_token_ratio = min(
             envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
             * server_args.schedule_conservativeness,
@@ -310,6 +328,7 @@ class OmniScheduler:
         ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
         self.new_token_ratio = self.init_new_token_ratio
         self.prefill_delayer = None
+        self.lora_drainer = None
 
         # Feature flags (all disabled)
         self.enable_lora = False
@@ -344,6 +363,30 @@ class OmniScheduler:
         self.dllm_config = None
         self.dllm_staging_reqs = DllmStagingReqs(dllm_config=None)
         self.draft_worker = None
+        self._execution_bridge = None
+        if model_runner is not None:
+            from sglang_omni.model_runner.sglang_execution import (
+                SGLangExecutionBridge,
+            )
+
+            self._execution_bridge = SGLangExecutionBridge(
+                device=torch.device(self.device),
+                worker=tp_worker,
+                req_to_token_pool=req_to_token_pool,
+                spec_algorithm=self.spec_algorithm,
+                # Omni async decode is deliberately a single-stream
+                # launch-current/resolve-previous loop.  SGLang's independent
+                # schedule/forward streams have a different WAR and sampling
+                # publication contract; opting into them here races decode
+                # CUDA-graph buffers even though eager decode appears correct.
+                # Only the upstream-style overlap loop owns that two-stream
+                # contract.
+                enable_stream_overlap=enable_overlap,
+            )
+            # Keep the upstream attribute available to delegated scheduler
+            # methods, but make the custom ModelRunner the sole owner of relay.
+            self.future_map = self._execution_bridge.future_map
+            model_runner.bind_execution_bridge(self._execution_bridge)
 
         # Subsystem stubs
         self.watchdog = None
@@ -387,7 +430,9 @@ class OmniScheduler:
         self.send_to_detokenizer = _NoOpSender()
 
         self._init_parallel_state(tp_worker)
-        self.init_metrics(self.tp_rank, self.pp_rank, self.dp_rank)
+        self.init_metrics_collector(self.tp_rank, self.pp_rank, self.dp_rank)
+        self.init_metrics_reporter(self.tp_rank, self.pp_rank, self.dp_rank)
+        self._init_upstream_scheduler_components()
 
         self._running = False
         self._aborted_request_ids: set[str] = set()
@@ -417,8 +462,22 @@ class OmniScheduler:
         # feature, so a stub with an empty sessions dict is sufficient.
         from types import SimpleNamespace
 
+        # SGLang 0.5.15 moved rank fields used by delegated scheduler methods
+        # behind ``self.ps``. Install a minimal value immediately; the real
+        # scheduler construction path replaces it after computing attention
+        # parallel ranks in _init_parallel_state().
+        self.ps = SimpleNamespace(pp_size=getattr(self, "pp_size", 1))
+        self.metrics_reporter = SimpleNamespace(
+            reset_metrics=lambda: getattr(self, "reset_metrics", lambda: None)(),
+            is_stats_logging_rank=False,
+        )
         self.session_controller = SimpleNamespace(sessions={})
         self.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
+        self.load_snapshot_writer = None
+        self.kv_events_publisher = SimpleNamespace(
+            emit_kv_metrics=lambda: None,
+            publish_kv_events=lambda: None,
+        )
         device = getattr(self, "device", None)
         self.device_module = (
             torch.get_device_module(device)
@@ -426,8 +485,113 @@ class OmniScheduler:
             else torch.get_device_module()
         )
 
+    def _init_upstream_scheduler_components(self) -> None:
+        """Install the scheduler components required by 0.5.15 hot paths."""
+        from sglang.srt.managers.scheduler_components.batch_result_processor import (
+            SchedulerBatchResultProcessor,
+        )
+        from sglang.srt.managers.scheduler_components.dp_attn import (
+            SchedulerDPAttnAdapter,
+        )
+        from sglang.srt.managers.scheduler_components.load_inquirer import (
+            SchedulerLoadInquirer,
+        )
+        from sglang.srt.managers.scheduler_components.logprob_result_processor import (
+            SchedulerLogprobResultProcessor,
+        )
+        from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+            SchedulerPoolStatsObserver,
+        )
+
+        self.dp_attn_adapter = SchedulerDPAttnAdapter(
+            tp_group=self.tp_group,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            offload_tags=self.offload_tags,
+            ps=self.ps,
+            server_args=self.server_args,
+            model_config=self.model_config,
+            enable_overlap=self.enable_overlap,
+            spec_algorithm=self.spec_algorithm,
+            get_require_mlp_sync=lambda: self.require_mlp_sync,
+        )
+        self.pool_stats_observer = SchedulerPoolStatsObserver(
+            tree_cache=self.tree_cache,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            req_to_token_pool=self.req_to_token_pool,
+            session_controller=self.session_controller,
+            hisparse_coordinator=self.hisparse_coordinator,
+            is_hybrid_swa=self.is_hybrid_swa,
+            is_hybrid_ssm=self.is_hybrid_ssm,
+            enable_hisparse=self.enable_hisparse,
+            full_tokens_per_layer=self.full_tokens_per_layer,
+            swa_tokens_per_layer=self.swa_tokens_per_layer,
+            max_total_num_tokens=(
+                self.max_total_num_tokens * getattr(self.server_args, "dcp_size", 1)
+            ),
+            get_last_batch=lambda: self.last_batch,
+            get_running_batch=lambda: self.running_batch,
+        )
+        empty_queue = types.SimpleNamespace(queue=[], retracted_queue=[])
+        self.load_inquirer = SchedulerLoadInquirer(
+            disaggregation_mode=self.disaggregation_mode,
+            ps=self.ps,
+            server_args=self.server_args,
+            max_total_num_tokens=self.max_total_num_tokens,
+            max_running_requests=self.max_running_requests,
+            pool_stats_observer=self.pool_stats_observer,
+            tp_worker=self.tp_worker,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            spec_algorithm=self.spec_algorithm,
+            get_running_batch=lambda: self.running_batch,
+            get_waiting_queue=lambda: self.waiting_queue,
+            get_stats=lambda: self.metrics_reporter.stats,
+            get_chunked_req=lambda: self.chunked_req,
+            get_disagg_prefill_bootstrap_queue=lambda: empty_queue,
+            get_disagg_prefill_inflight_queue=lambda: [],
+            get_disagg_decode_prealloc_queue=lambda: empty_queue,
+            get_disagg_decode_transfer_queue=lambda: empty_queue,
+            get_spec_total_num_accept_tokens=lambda: getattr(
+                self.metrics_reporter, "spec_total_num_accept_tokens", 0
+            ),
+            get_spec_total_num_forward_ct=lambda: getattr(
+                self.metrics_reporter, "spec_total_num_forward_ct", 0
+            ),
+        )
+        self.output_streamer = types.SimpleNamespace(
+            stream_output=self.stream_output,
+            _stream_output_generation=lambda reqs, return_logprob, **_kwargs: self.stream_output(
+                reqs, return_logprob
+            ),
+        )
+        self.batch_result_processor = SchedulerBatchResultProcessor(
+            is_generation=self.is_generation,
+            disaggregation_mode=self.disaggregation_mode,
+            enable_overlap=self.enable_overlap,
+            enable_overlap_mlx=self.enable_overlap_mlx,
+            server_args=self.server_args,
+            model_config=self.model_config,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            hisparse_coordinator=self.hisparse_coordinator,
+            req_to_token_pool=self.req_to_token_pool,
+            decode_offload_manager=self.decode_offload_manager,
+            metrics_collector=self.metrics_collector,
+            metrics_reporter=self.metrics_reporter,
+            draft_worker=self.draft_worker,
+            model_worker=self.model_worker,
+            logprob_result_processor=SchedulerLogprobResultProcessor(
+                server_args=self.server_args,
+                model_config=self.model_config,
+            ),
+            output_streamer=self.output_streamer,
+            abort_request=lambda request: self.abort(request.rid),
+        )
+
     def self_check_during_idle(self) -> None:
-        self.new_token_ratio = self.init_new_token_ratio
+        self.new_token_ratio_tracker.reset()
+        self.new_token_ratio = self.new_token_ratio_tracker.current
         idle_sleeper = self.__dict__.get("idle_sleeper")
         if idle_sleeper is not None:
             idle_sleeper.maybe_sleep()
@@ -467,13 +631,17 @@ class OmniScheduler:
 
     def _init_parallel_state(self, tp_worker: Any) -> None:
         enable_dp_attention = self.server_args.enable_dp_attention
-        self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
-            compute_dp_attention_world_info(
-                enable_dp_attention,
-                self.tp_rank,
-                self.tp_size,
-                self.dp_size,
-            )
+        (
+            self.attn_tp_rank,
+            self.attn_tp_size,
+            self.attn_dp_rank,
+            self.attn_dp_size,
+        ) = compute_dp_attention_world_info(
+            enable_dp_attention,
+            self.tp_rank,
+            self.tp_size,
+            self.dp_size,
+            self.attn_cp_size,
         )
 
         self.tp_group = tp_worker.get_tp_group()
@@ -494,6 +662,31 @@ class OmniScheduler:
 
         self.current_scheduler_metrics_enabled = (
             self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
+        )
+        self._refresh_upstream_parallel_state()
+
+    def _refresh_upstream_parallel_state(self) -> None:
+        """Build the rank container expected by SGLang 0.5.15 methods."""
+        from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+
+        self.ps = ParallelState(
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            dp_rank=self.dp_rank,
+            dp_size=self.dp_size,
+            attn_tp_rank=self.attn_tp_rank,
+            attn_tp_size=self.attn_tp_size,
+            attn_cp_rank=self.attn_cp_rank,
+            attn_cp_size=self.attn_cp_size,
+            attn_dp_rank=self.attn_dp_rank,
+            attn_dp_size=self.attn_dp_size,
+            moe_ep_rank=self.moe_ep_rank,
+            moe_ep_size=self.moe_ep_size,
+            moe_dp_rank=self.moe_dp_rank,
+            moe_dp_size=self.moe_dp_size,
+            gpu_id=self.gpu_id,
         )
 
     def recv_requests(self):
@@ -714,6 +907,7 @@ class OmniScheduler:
             self._pending_stream_done.discard(req_id)
         self._deferred_request_payloads.pop(req_id, None)
         req = req_data.req
+        self._normalize_req_token_arrays(req)
         req._omni_data = req_data
         req_id = req.rid
         if bool(getattr(req_data, "enforce_request_limits", False)):
@@ -752,6 +946,30 @@ class OmniScheduler:
         else:
             with self._request_admission_lock:
                 enqueue_if_live()
+
+    @staticmethod
+    def _normalize_req_token_arrays(req: Any) -> None:
+        """Install the Req compatibility state used by Omni model runners."""
+        # SGLang 0.5.15 removed this counter in favor of ScheduleBatch's
+        # chunked-request lifecycle. Omni model runners still use it to suppress
+        # intermediate chunk outputs, so keep it as an Omni-owned sidecar.
+        if not hasattr(req, "is_chunked"):
+            req.is_chunked = 0
+        if not hasattr(req, "extend_input_len"):
+            extend_range = getattr(req, "extend_range", None)
+            req.extend_input_len = (
+                int(extend_range.length) if extend_range is not None else 0
+            )
+
+        origin_input_ids = req.origin_input_ids
+        if not isinstance(origin_input_ids, array):
+            req.origin_input_ids = array("q", origin_input_ids)
+
+        unpadded = getattr(req, "origin_input_ids_unpadded", origin_input_ids)
+        if unpadded is origin_input_ids:
+            req.origin_input_ids_unpadded = req.origin_input_ids
+        elif not isinstance(unpadded, array):
+            req.origin_input_ids_unpadded = array("q", unpadded)
 
     def _prepare_request_limits(self, req_data: Any) -> str | None:
         req = req_data.req
@@ -890,11 +1108,28 @@ class OmniScheduler:
         expects. Shared by the sync and async (launch) paths."""
         from sglang_omni.scheduling.types import SchedulerOutput, SchedulerRequest
 
+        self._sync_legacy_extend_input_lens(batch)
         sched_reqs = [
             SchedulerRequest(request_id=req.rid, data=req._omni_data)
             for req in batch.reqs
         ]
         return SchedulerOutput(requests=sched_reqs, batch_data=batch)
+
+    @staticmethod
+    def _sync_legacy_extend_input_lens(batch: Any) -> None:
+        """Publish 0.5.12's Req.extend_input_len for Omni model runners."""
+        forward_mode = getattr(batch, "forward_mode", None)
+        if forward_mode is None or not forward_mode.is_extend():
+            return
+        extend_lens = getattr(batch, "extend_lens", None)
+        if extend_lens is None:
+            extend_lens = [req.extend_range.length for req in batch.reqs]
+        if len(extend_lens) != len(batch.reqs):
+            raise RuntimeError(
+                "ScheduleBatch extend_lens does not match its request count"
+            )
+        for req, extend_len in zip(batch.reqs, extend_lens):
+            req.extend_input_len = int(extend_len)
 
     def _emit_stream_output(self, sched_output, mr_output, skip_rids=()) -> None:
         """Emit per-request stream chunks from a ModelRunnerOutput. Shared by
@@ -925,13 +1160,17 @@ class OmniScheduler:
 
     @staticmethod
     def _make_batch_result(batch, mr_output):
-        # process_batch_result reads .next_token_ids / .logits_output; the
-        # model runner already set batch.output_ids during execute/resolve.
+        # process_batch_result reads reporting tokens. The next-forward GPU
+        # token rail is independently published through FutureMap.
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
-        next_token_ids = batch.output_ids
-        if isinstance(next_token_ids, torch.Tensor):
-            batch.input_ids = next_token_ids.to(torch.int64)
+        next_token_ids = getattr(mr_output, "next_token_ids", None)
+        if next_token_ids is None:
+            # Compatibility for third-party custom runners which still publish
+            # the pre-0.5.15 ScheduleBatch side channel.
+            next_token_ids = getattr(batch, "output_ids", None)
+            if isinstance(next_token_ids, torch.Tensor):
+                batch.input_ids = next_token_ids.to(torch.int64)
         return GenerationBatchResult(
             logits_output=None,
             next_token_ids=next_token_ids,
@@ -968,7 +1207,7 @@ class OmniScheduler:
         self._emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
         return GenerationBatchResult(
             logits_output=None,
-            next_token_ids=pending_step.batch_result.next_token_ids,
+            next_token_ids=mr_output.next_token_ids,
             can_run_cuda_graph=mr_output.can_run_cuda_graph,
         )
 
@@ -1091,12 +1330,17 @@ class OmniScheduler:
         self._scheduler_thread_id = threading.get_ident()
         self._running = True
         try:
-            if getattr(self, "enable_async_decode", False):
-                self._event_loop_async_decode()
-            elif self.enable_overlap:
-                self._event_loop_overlap()
-            else:
-                self._event_loop_normal()
+            bridge = self.__dict__.get("_execution_bridge")
+            loop_context = (
+                bridge.loop_context() if bridge is not None else nullcontext()
+            )
+            with loop_context:
+                if getattr(self, "enable_async_decode", False):
+                    self._event_loop_async_decode()
+                elif self.enable_overlap:
+                    self._event_loop_overlap()
+                else:
+                    self._event_loop_normal()
         finally:
             self._scheduler_thread_id = None
             try:
@@ -1701,6 +1945,9 @@ class OmniScheduler:
                 time.sleep(0.001)
                 continue
 
+            bridge = self.__dict__.get("_execution_bridge")
+            if bridge is not None:
+                bridge.before_schedule()
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
@@ -1943,6 +2190,9 @@ class OmniScheduler:
             ):
                 self._resolve_pending_async()
 
+            bridge = self.__dict__.get("_execution_bridge")
+            if bridge is not None:
+                bridge.before_schedule()
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
