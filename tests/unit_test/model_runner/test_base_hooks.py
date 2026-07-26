@@ -27,11 +27,11 @@ def _install_fake_forward_batch_module(monkeypatch: pytest.MonkeyPatch) -> None:
 
     class ForwardBatch:
         @staticmethod
-        def init_new(model_worker_batch, model_runner):
+        def init_new(schedule_batch, model_runner):
             del model_runner
             return SimpleNamespace(
                 input_ids=torch.tensor([1]),
-                marker=model_worker_batch.marker,
+                marker=schedule_batch.marker,
             )
 
     forward_batch_info = types.ModuleType(
@@ -140,7 +140,7 @@ def test_build_forward_batch_materializes_deferred_prefill_input_ids(monkeypatch
     built = runner._build_forward_batch(scheduler_output)
 
     assert built is not None
-    forward_batch, schedule_batch, _, is_prefill = built
+    forward_batch, schedule_batch, is_prefill = built
     assert is_prefill is True
     assert schedule_batch.prefill_input_ids_cpu is None
     assert torch.equal(schedule_batch.input_ids, staged)
@@ -259,7 +259,6 @@ def test_finalize_default_batch_generation_hook_calls_single_hook() -> None:
         ),
         SimpleNamespace(),
         SimpleNamespace(is_prefill_only=False, output_ids=None),
-        SimpleNamespace(seq_lens=[1, 1], input_ids=torch.zeros(2, dtype=torch.long)),
         SimpleNamespace(requests=requests),
     )
 

@@ -46,7 +46,7 @@ class _StubRunner(ModelRunner):
             is_prefill_only=False, output_ids=None, input_ids=None
         )
         self.last_schedule_batch = sb
-        return types.SimpleNamespace(), sb, types.SimpleNamespace(), False  # decode
+        return types.SimpleNamespace(), sb, False  # decode
 
     def _prepare_and_forward(
         self,
@@ -79,7 +79,6 @@ class _StubRunner(ModelRunner):
         batch_result,
         forward_batch,
         schedule_batch,
-        model_worker_batch,
         scheduler_output,
         set_output_ids=True,
         skip_rids=None,
@@ -283,7 +282,6 @@ def test_finalize_skips_overrun_bookkeeping_and_extras():
         can_run_cuda_graph=False,
     )
     schedule_batch = types.SimpleNamespace(is_prefill_only=False, output_ids=None)
-    model_worker_batch = types.SimpleNamespace()
     keep_data = types.SimpleNamespace(generation_steps=0, extra_model_outputs={})
     skip_data = types.SimpleNamespace(generation_steps=0, extra_model_outputs={})
     scheduler_output = types.SimpleNamespace(
@@ -297,7 +295,6 @@ def test_finalize_skips_overrun_bookkeeping_and_extras():
         batch_result,
         types.SimpleNamespace(),
         schedule_batch,
-        model_worker_batch,
         scheduler_output,
         skip_rids={"skip"},
     )
@@ -343,7 +340,6 @@ def test_finalize_unions_finalize_skip_rids_hook():
         batch_result,
         types.SimpleNamespace(),
         schedule_batch,
-        types.SimpleNamespace(),
         scheduler_output,
     )
 

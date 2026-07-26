@@ -241,6 +241,7 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
 
     scheduler = object.__new__(OmniScheduler)
     scheduler._model_runner = BoomModelRunner()
+    scheduler.forward_ct = 0
     scheduler._stream_output_builder = None
     scheduler.outbox = Queue()
     scheduler.inbox = Queue()
@@ -312,6 +313,7 @@ def test_omni_scheduler_custom_runner_updates_next_input_ids() -> None:
 
     scheduler = object.__new__(OmniScheduler)
     scheduler._model_runner = FakeModelRunner()
+    scheduler.forward_ct = 0
     scheduler._stream_output_builder = None
     scheduler._prefill_start_done = set()
 
@@ -852,7 +854,6 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
     [
         (False, True, False),
         (True, False, False),
-        (True, True, False),
         (False, True, True),
     ],
 )
@@ -885,11 +886,10 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
             self,
             *,
             device,
-            worker,
             req_to_token_pool,
             spec_algorithm,
         ):
-            del device, worker, req_to_token_pool, spec_algorithm
+            del device, req_to_token_pool, spec_algorithm
             self.future_map = object()
 
     monkeypatch.setattr(

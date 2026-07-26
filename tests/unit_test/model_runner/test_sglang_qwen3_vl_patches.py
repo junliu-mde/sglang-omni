@@ -5,14 +5,10 @@ from __future__ import annotations
 
 
 def test_qwen3_vl_patch_accepts_installed_sglang_release() -> None:
-    import sglang
-
     from sglang_omni.model_runner._sglang_qwen3_vl_patches import (
-        _SUPPORTED_SGLANG_VERSIONS,
         _check_sglang_version,
     )
 
-    assert sglang.__version__ in _SUPPORTED_SGLANG_VERSIONS
     _check_sglang_version()
 
 

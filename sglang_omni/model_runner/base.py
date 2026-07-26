@@ -187,7 +187,7 @@ class ModelRunner:
             built = self._build_forward_batch(scheduler_output)
             if built is None:
                 return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
-            forward_batch, schedule_batch, model_worker_batch, is_prefill = built
+            forward_batch, schedule_batch, is_prefill = built
             batch_result = self._prepare_and_forward(
                 forward_batch, schedule_batch, scheduler_output.requests, is_prefill
             )
@@ -209,20 +209,13 @@ class ModelRunner:
                 batch_result,
                 forward_batch,
                 schedule_batch,
-                model_worker_batch,
                 scheduler_output,
             )
-            self._publish_next_tokens(
-                batch_result,
-                forward_batch,
-                schedule_batch,
-                scheduler_output.requests,
-            )
+            self._publish_next_tokens(batch_result, schedule_batch)
         return self._finalize(
             batch_result,
             forward_batch,
             schedule_batch,
-            model_worker_batch,
             scheduler_output,
             set_output_ids=getattr(self, "_execution_bridge", None) is None,
         )
@@ -250,7 +243,7 @@ class ModelRunner:
             built = self._build_forward_batch(scheduler_output)
             if built is None:
                 return None
-            forward_batch, schedule_batch, model_worker_batch, is_prefill = built
+            forward_batch, schedule_batch, is_prefill = built
             assert not is_prefill, "async lookahead launch is decode-only"
             batch_result = self._prepare_and_forward(
                 forward_batch,
@@ -266,15 +259,9 @@ class ModelRunner:
                 batch_result,
                 forward_batch,
                 schedule_batch,
-                model_worker_batch,
                 scheduler_output,
             )
-            self._publish_next_tokens(
-                batch_result,
-                forward_batch,
-                schedule_batch,
-                scheduler_output.requests,
-            )
+            self._publish_next_tokens(batch_result, schedule_batch)
             bridge = getattr(self, "_execution_bridge", None)
             if bridge is None:
                 # Compatibility path for runners not owned by OmniScheduler.
@@ -339,7 +326,6 @@ class ModelRunner:
             pending.batch_result,
             pending.forward_batch,
             pending.schedule_batch,
-            pending.schedule_batch,
             pending.scheduler_output,
             set_output_ids=False,
             skip_rids=skip_rids,
@@ -347,8 +333,8 @@ class ModelRunner:
 
     def _build_forward_batch(self, scheduler_output: Any):
         """Build the ForwardBatch + capture-hidden mode. Returns
-        ``(forward_batch, schedule_batch, model_worker_batch, is_prefill)``, or
-        None when there is no batch to run."""
+        ``(forward_batch, schedule_batch, is_prefill)``, or None when there is
+        no batch to run."""
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
             ForwardBatch,
@@ -361,7 +347,6 @@ class ModelRunner:
         if schedule_batch is None:
             return None
 
-        model_worker_batch = schedule_batch
         is_prefill = bool(schedule_batch.forward_mode.is_extend())
 
         capture_hidden_mode = (
@@ -374,16 +359,16 @@ class ModelRunner:
             )
         )
         if capture_hidden_mode is not None:
-            model_worker_batch.capture_hidden_mode = capture_hidden_mode
+            schedule_batch.capture_hidden_mode = capture_hidden_mode
         elif self.output_processor._capture_hidden:
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+            schedule_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
         if getattr(self, "_execution_bridge", None) is None:
             resolve_deferred_prefill_inputs(schedule_batch, self.device)
         forward_batch = ForwardBatch.init_new(
             schedule_batch, self.tp_worker.model_runner
         )
-        return forward_batch, schedule_batch, model_worker_batch, is_prefill
+        return forward_batch, schedule_batch, is_prefill
 
     def _prepare_and_forward(
         self,
@@ -472,7 +457,6 @@ class ModelRunner:
         batch_result,
         forward_batch,
         schedule_batch,
-        model_worker_batch,
         scheduler_output,
         set_output_ids: bool = True,
         skip_rids: set[str] | None = None,
@@ -488,7 +472,6 @@ class ModelRunner:
             batch_result,
             forward_batch,
             schedule_batch,
-            model_worker_batch,
             scheduler_output,
         )
         if set_output_ids:
@@ -526,16 +509,15 @@ class ModelRunner:
         batch_result: Any,
         forward_batch: Any,
         schedule_batch: Any,
-        model_worker_batch: Any,
         scheduler_output: Any,
     ) -> None:
         """Materialize this step's reporting tokens while still on its stream."""
         if schedule_batch.is_prefill_only:
             if batch_result.next_token_ids is None:
                 batch_result.next_token_ids = torch.zeros(
-                    len(model_worker_batch.seq_lens),
+                    len(schedule_batch.seq_lens),
                     dtype=torch.long,
-                    device=model_worker_batch.input_ids.device,
+                    device=schedule_batch.input_ids.device,
                 )
         elif batch_result.next_token_ids is None:
             batch_result.next_token_ids = self._sample_next_token_ids(
@@ -545,33 +527,22 @@ class ModelRunner:
                 scheduler_output.requests,
             )
 
-    def next_input_token_ids(
-        self,
-        result: Any,
-        forward_batch: Any,
-        requests: list,
-    ) -> torch.Tensor | None:
-        """Return the GPU token rail consumed by the next forward."""
-        del forward_batch, requests
-        return (
-            result.next_token_ids
-            if isinstance(result.next_token_ids, torch.Tensor)
-            else None
-        )
-
     def _publish_next_tokens(
         self,
         result: Any,
-        forward_batch: Any,
         schedule_batch: Any,
-        requests: list,
     ) -> None:
         bridge = getattr(self, "_execution_bridge", None)
         if bridge is None or schedule_batch.is_prefill_only:
             return
+        next_token_ids = (
+            result.next_token_ids
+            if isinstance(result.next_token_ids, torch.Tensor)
+            else None
+        )
         bridge.publish_next_tokens(
             schedule_batch,
-            self.next_input_token_ids(result, forward_batch, requests),
+            next_token_ids,
         )
 
     # ------------------------------------------------------------------

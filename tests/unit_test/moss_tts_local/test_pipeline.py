@@ -1722,7 +1722,6 @@ def test_chunked_prefill_generation_steps_matches_single_shot():
             ),
             types.SimpleNamespace(),
             types.SimpleNamespace(is_prefill_only=False, output_ids=None),
-            types.SimpleNamespace(),
             types.SimpleNamespace(requests=[sched_req]),
         )
 

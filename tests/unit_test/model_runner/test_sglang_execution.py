@@ -11,13 +11,9 @@ from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
 class _FutureMap:
     def __init__(self) -> None:
         self.stashed = None
-        self.published = None
 
     def stash(self, indices, payload) -> None:
         self.stashed = (indices, payload)
-
-    def publish(self, indices, seq_lens) -> None:
-        self.published = (indices, seq_lens)
 
 
 class _SpecAlgorithm:
@@ -28,7 +24,7 @@ class _SpecAlgorithm:
     def create_future_map(self, device, req_to_token_pool, needs_cpu_seq_lens):
         assert device == torch.device("cpu")
         assert req_to_token_pool == "pool"
-        assert needs_cpu_seq_lens is True
+        assert needs_cpu_seq_lens is False
         return self.future_map
 
     def is_none(self) -> bool:
@@ -37,10 +33,8 @@ class _SpecAlgorithm:
 
 def _make_bridge() -> tuple[SGLangExecutionBridge, _FutureMap]:
     future_map = _FutureMap()
-    worker = SimpleNamespace(model_runner=SimpleNamespace())
     bridge = SGLangExecutionBridge(
         device=torch.device("cpu"),
-        worker=worker,
         req_to_token_pool="pool",
         spec_algorithm=_SpecAlgorithm(future_map),
     )
@@ -51,7 +45,6 @@ def test_publish_next_tokens_uses_future_map_and_retires_input_ids() -> None:
     bridge, future_map = _make_bridge()
     batch = SimpleNamespace(
         req_pool_indices=torch.tensor([4, 7]),
-        seq_lens=torch.tensor([12, 19]),
         input_ids=torch.tensor([1, 2]),
     )
     next_token_ids = torch.tensor([31, 32])
@@ -61,9 +54,6 @@ def test_publish_next_tokens_uses_future_map_and_retires_input_ids() -> None:
     stash_indices, payload = future_map.stashed
     assert torch.equal(stash_indices, batch.req_pool_indices)
     assert torch.equal(payload.bonus_tokens, next_token_ids)
-    publish_indices, publish_seq_lens = future_map.published
-    assert torch.equal(publish_indices, batch.req_pool_indices)
-    assert torch.equal(publish_seq_lens, torch.tensor([13, 20]))
     assert batch.input_ids is None
 
 
@@ -135,12 +125,10 @@ def test_forward_context_resolves_mixed_prefill(monkeypatch) -> None:
 
 def test_execution_bridge_rejects_speculative_decoding() -> None:
     future_map = _FutureMap()
-    worker = SimpleNamespace(model_runner=SimpleNamespace())
 
     with pytest.raises(NotImplementedError, match="speculative decoding"):
         SGLangExecutionBridge(
             device=torch.device("cpu"),
-            worker=worker,
             req_to_token_pool="pool",
             spec_algorithm=_SpecAlgorithm(future_map, is_none=False),
         )

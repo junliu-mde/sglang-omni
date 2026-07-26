@@ -370,7 +370,6 @@ class OmniScheduler:
 
             self._execution_bridge = SGLangExecutionBridge(
                 device=torch.device(self.device),
-                worker=tp_worker,
                 req_to_token_pool=req_to_token_pool,
                 spec_algorithm=self.spec_algorithm,
             )
@@ -454,7 +453,6 @@ class OmniScheduler:
 
         bridge = SGLangExecutionBridge(
             device=torch.device(self.device),
-            worker=self.tp_worker,
             req_to_token_pool=self.req_to_token_pool,
             spec_algorithm=self.spec_algorithm,
         )
@@ -1115,13 +1113,7 @@ class OmniScheduler:
         """
         self._emit_prefill_start_for_batch(batch)
         if self._model_runner is not None:
-            # Mirror upstream run_batch's per-forward counter: OmniScheduler
-            # overrides run_batch, so without this forward_ct stays 0 and
-            # SGLANG_TEST_RETRACT fires every step. Only the custom-runner path
-            # needs it (the fallback reaches upstream run_batch, which counts).
-            self.forward_ct = getattr(self, "forward_ct", 0) + 1
-            batch.forward_iter = self.forward_ct
-            sched_output = self._build_sched_output(batch)
+            sched_output = self._begin_custom_forward(batch)
             mr_output = self._model_runner.execute(sched_output)
             self._emit_stream_output(sched_output, mr_output)
             return self._make_batch_result(batch, mr_output)
@@ -1140,6 +1132,12 @@ class OmniScheduler:
             for req in batch.reqs
         ]
         return SchedulerOutput(requests=sched_reqs, batch_data=batch)
+
+    def _begin_custom_forward(self, batch):
+        """Stamp one custom-runner forward and build its scheduler wrapper."""
+        self.forward_ct += 1
+        batch.forward_iter = self.forward_ct
+        return self._build_sched_output(batch)
 
     @staticmethod
     def _sync_legacy_is_chunked(batch: Any) -> None:
@@ -1237,11 +1235,7 @@ class OmniScheduler:
         payload), without waiting. Returns ``(sched_output, pending_step)``; the
         caller holds the pending step (launch-first keeps two steps in flight)."""
         self._emit_prefill_start_for_batch(batch)
-        # One forward per launch; mirror upstream run_batch's per-forward
-        # counter (the matching resolve does no forward, so it must not count).
-        self.forward_ct = getattr(self, "forward_ct", 0) + 1
-        batch.forward_iter = self.forward_ct
-        sched_output = self._build_sched_output(batch)
+        sched_output = self._begin_custom_forward(batch)
         pending_step = self._model_runner.execute_launch(sched_output)
         return sched_output, pending_step
 
