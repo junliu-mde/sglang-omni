@@ -481,11 +481,16 @@ def create_vocoder_executor(
     stream_overlap_tokens: int = 8,
     stream_holdback_tokens: int = 4,
     compile_decode: bool = False,
+    decode_cuda_graph_frame_counts: tuple[int, ...] = (),
 ):
     """Decode Higgs delayed codes to a mono 24 kHz waveform.
 
     Codec weights are extracted from the TTS checkpoint itself.
     """
+    if compile_decode and decode_cuda_graph_frame_counts:
+        raise ValueError(
+            "compile_decode and decode_cuda_graph_frame_counts are mutually exclusive"
+        )
     checkpoint_dir = resolve_checkpoint(model_path)
     codec = get_or_load_codec(checkpoint_dir, device, dtype)
     if compile_decode:
@@ -513,6 +518,10 @@ def create_vocoder_executor(
                 exc_info=True,
             )
             codec.model.decode = eager_decode
+    elif decode_cuda_graph_frame_counts:
+        codec.capture_decode_cuda_graphs(
+            tuple(int(value) for value in decode_cuda_graph_frame_counts)
+        )
 
     return HiggsStreamingVocoderScheduler(
         codec,

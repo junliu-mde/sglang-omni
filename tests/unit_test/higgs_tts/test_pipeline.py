@@ -40,7 +40,21 @@ def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
 
     assert stages_by_name["tts_engine"].stream_to == ["vocoder"]
     assert "server_args_overrides" not in stages_by_name["tts_engine"].factory_args
+    assert stages_by_name["vocoder"].factory_args["compile_decode"] is True
+    assert (
+        "decode_cuda_graph_frame_counts"
+        not in stages_by_name["vocoder"].factory_args
+    )
     assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
+
+
+def test_higgs_vocoder_rejects_compile_and_graph_domain_together() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        stages.create_vocoder_executor(
+            "unused-model-path",
+            compile_decode=True,
+            decode_cuda_graph_frame_counts=(1, 2),
+        )
 
 
 def test_higgs_batch_metadata_uses_sglang_rids() -> None:
@@ -1323,6 +1337,33 @@ def _fake_codec_fixtures(monkeypatch):
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda p: p)
     monkeypatch.setattr(stages, "get_or_load_codec", lambda *a, **kw: FakeCodec())
     return decode_batch_sizes
+
+
+def test_higgs_vocoder_captures_requested_cuda_graph_domain(monkeypatch) -> None:
+    captured: list[tuple[int, ...]] = []
+
+    class FakeCodec:
+        def capture_decode_cuda_graphs(self, frame_counts: tuple[int, ...]) -> None:
+            captured.append(frame_counts)
+
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda path: path)
+    monkeypatch.setattr(
+        stages,
+        "get_or_load_codec",
+        lambda *_args, **_kwargs: FakeCodec(),
+    )
+    monkeypatch.setattr(
+        stages,
+        "HiggsStreamingVocoderScheduler",
+        lambda codec, **kwargs: (codec, kwargs),
+    )
+
+    stages.create_vocoder_executor(
+        "fake-model",
+        decode_cuda_graph_frame_counts=(1, 2),
+    )
+
+    assert captured == [(1, 2)]
 
 
 def test_higgs_tts_vocoder_batches_decode_requests(
