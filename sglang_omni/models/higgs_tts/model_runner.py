@@ -82,14 +82,26 @@ class HiggsTTSModelRunner(ModelRunner):
 
     def before_prefill(self, forward_batch, schedule_batch, requests):
         del schedule_batch
-        forward_batch.req_ids = [req.request_id for req in requests]
         for req in requests:
             self.model.set_request_seed(
                 req.request_id, req.data.req.sampling_params.sampling_seed
             )
-        forward_batch.input_embeds = self._build_prefill_input_embeds(
+        # SGLang 0.5.15's EagerRunner rebuilds ForwardBatch into static
+        # buffers and drops its public input_embeds field. Keep this
+        # one-forward value on the model; model.forward consumes it.
+        if getattr(self.model, "_pending_prefill_input_embeds", None) is not None:
+            raise RuntimeError(
+                "Higgs prefill input embeddings were not consumed by the "
+                "previous forward"
+            )
+        self.model._pending_prefill_input_embeds = self._build_prefill_input_embeds(
             forward_batch, requests
         )
+        forward_batch.input_embeds = None
+
+    def cleanup_prefill(self, forward_batch, schedule_batch, requests):
+        del forward_batch, schedule_batch, requests
+        self.model._pending_prefill_input_embeds = None
 
     def post_prefill(self, result, forward_batch, schedule_batch, requests):
         del schedule_batch
@@ -104,7 +116,6 @@ class HiggsTTSModelRunner(ModelRunner):
         is_lookahead: bool = False,
     ):
         del schedule_batch
-        forward_batch.req_ids = [req.request_id for req in requests]
         self._populate_cg_buffers(forward_batch, requests, is_lookahead=is_lookahead)
 
     def post_decode(self, result, forward_batch, schedule_batch, requests):

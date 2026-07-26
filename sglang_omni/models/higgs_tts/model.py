@@ -434,6 +434,13 @@ class HiggsTTSModel(nn.Module):
                 input_ids, batch_size=input_ids.shape[0]
             )
         else:
+            if input_embeds is None:
+                input_embeds = getattr(self, "_pending_prefill_input_embeds", None)
+                self._pending_prefill_input_embeds = None
+            if input_embeds is None:
+                raise RuntimeError(
+                    "Higgs prefill requires composed multi-codebook input embeddings"
+                )
             req_ids, gen_params = self._extract_batch_metadata(forward_batch)
 
         hidden_states = self.backbone.model(
@@ -497,12 +504,17 @@ class HiggsTTSModel(nn.Module):
     def _extract_batch_metadata(
         self, forward_batch
     ) -> tuple[list[str], list[HiggsGenParams]]:
-        req_ids_raw = getattr(forward_batch, "req_ids", None)
+        # ``rids`` is part of SGLang's ForwardBatch contract and survives the
+        # 0.5.15 EagerRunner static-buffer copy. Dynamic attributes such as the
+        # old Omni-only ``req_ids`` do not.
+        req_ids_raw = getattr(forward_batch, "rids", None)
         batch_size = self._infer_batch_size(forward_batch)
         if req_ids_raw is None:
-            req_ids = [f"req-{i}" for i in range(batch_size)]
-        else:
-            req_ids = [str(r) for r in req_ids_raw]
+            raise RuntimeError(
+                "Higgs prefill batch is missing ForwardBatch.rids; refusing "
+                "to fabricate request identities"
+            )
+        req_ids = [str(r) for r in req_ids_raw]
 
         sampling_info = getattr(forward_batch, "sampling_info", None)
         gen_params = self._gen_params_for_batch(sampling_info, batch_size)

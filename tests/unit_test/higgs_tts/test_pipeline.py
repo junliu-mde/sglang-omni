@@ -16,6 +16,7 @@ from sglang_omni.config.runtime import resolve_stage_static_factory_args
 from sglang_omni.models.higgs_tts import stages
 from sglang_omni.models.higgs_tts import utils as higgs_utils
 from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
+from sglang_omni.models.higgs_tts.model import HiggsTTSModel
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.request_builders import build_higgs_stream_metadata
@@ -40,6 +41,90 @@ def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
     assert stages_by_name["tts_engine"].stream_to == ["vocoder"]
     assert "server_args_overrides" not in stages_by_name["tts_engine"].factory_args
     assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
+
+
+def test_higgs_batch_metadata_uses_sglang_rids() -> None:
+    model = object.__new__(HiggsTTSModel)
+    forward_batch = SimpleNamespace(
+        rids=["stable-a", "stable-b"],
+        seq_lens=torch.tensor([1, 1]),
+        sampling_info=None,
+    )
+
+    req_ids, params = model._extract_batch_metadata(forward_batch)
+
+    assert req_ids == ["stable-a", "stable-b"]
+    assert len(params) == 2
+
+
+def test_higgs_batch_metadata_refuses_missing_request_ids() -> None:
+    model = object.__new__(HiggsTTSModel)
+    forward_batch = SimpleNamespace(
+        rids=None,
+        seq_lens=torch.tensor([1, 1]),
+        sampling_info=None,
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to fabricate"):
+        model._extract_batch_metadata(forward_batch)
+
+
+def test_higgs_prefill_embeddings_use_one_forward_handoff() -> None:
+    model = SimpleNamespace(
+        _pending_prefill_input_embeds=None,
+        set_request_seed=lambda _request_id, _seed: None,
+    )
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner.model = model
+    input_embeds = torch.arange(12, dtype=torch.float32).view(3, 4)
+    runner._build_prefill_input_embeds = lambda _forward_batch, _requests: input_embeds
+    request = SimpleNamespace(
+        request_id="request",
+        data=SimpleNamespace(
+            req=SimpleNamespace(sampling_params=SimpleNamespace(sampling_seed=None))
+        ),
+    )
+    forward_batch = SimpleNamespace(input_embeds=input_embeds)
+
+    runner.before_prefill(forward_batch, None, [request])
+
+    assert model._pending_prefill_input_embeds is input_embeds
+    assert forward_batch.input_embeds is None
+    runner.cleanup_prefill(forward_batch, None, [request])
+    assert model._pending_prefill_input_embeds is None
+
+
+def test_higgs_prefill_forward_failure_clears_pending_embeddings() -> None:
+    model = SimpleNamespace(
+        _pending_prefill_input_embeds=None,
+        set_request_seed=lambda _request_id, _seed: None,
+    )
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner.model = model
+    input_embeds = torch.arange(12, dtype=torch.float32).view(3, 4)
+    runner._build_prefill_input_embeds = lambda _forward_batch, _requests: input_embeds
+    request = SimpleNamespace(
+        request_id="request",
+        data=SimpleNamespace(
+            req=SimpleNamespace(sampling_params=SimpleNamespace(sampling_seed=None))
+        ),
+    )
+    schedule_batch = SimpleNamespace(is_prefill_only=True)
+
+    runner.tp_worker = SimpleNamespace(
+        forward_batch_generation=lambda _forward_batch: (_ for _ in ()).throw(
+            RuntimeError("forward setup failed")
+        )
+    )
+    with pytest.raises(RuntimeError, match="forward setup failed"):
+        runner._prepare_and_forward(
+            SimpleNamespace(input_embeds=input_embeds),
+            schedule_batch,
+            [request],
+            True,
+        )
+
+    assert model._pending_prefill_input_embeds is None
 
 
 def test_higgs_streaming_pipeline_shares_vocoder_stride_with_tts_engine() -> None:
@@ -135,10 +220,10 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
         )
         model_runner = SimpleNamespace(model=model)
 
-        def init_device_graphs() -> None:
+        def init_cuda_graphs() -> None:
             init_graph_calls.append(True)
 
-        model_runner.init_device_graphs = init_device_graphs
+        model_runner.init_cuda_graphs = init_cuda_graphs
         return (
             SimpleNamespace(model_runner=model_runner),
             object(),
