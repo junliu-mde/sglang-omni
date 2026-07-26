@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from contextlib import nullcontext
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
@@ -21,8 +21,9 @@ class _FutureMap:
 
 
 class _SpecAlgorithm:
-    def __init__(self, future_map: _FutureMap) -> None:
+    def __init__(self, future_map: _FutureMap, *, is_none: bool = True) -> None:
         self.future_map = future_map
+        self._is_none = is_none
 
     def create_future_map(self, device, req_to_token_pool, needs_cpu_seq_lens):
         assert device == torch.device("cpu")
@@ -31,7 +32,7 @@ class _SpecAlgorithm:
         return self.future_map
 
     def is_none(self) -> bool:
-        return True
+        return self._is_none
 
 
 def _make_bridge() -> tuple[SGLangExecutionBridge, _FutureMap]:
@@ -42,7 +43,6 @@ def _make_bridge() -> tuple[SGLangExecutionBridge, _FutureMap]:
         worker=worker,
         req_to_token_pool="pool",
         spec_algorithm=_SpecAlgorithm(future_map),
-        enable_stream_overlap=False,
     )
     return bridge, future_map
 
@@ -67,7 +67,7 @@ def test_publish_next_tokens_uses_future_map_and_retires_input_ids() -> None:
     assert batch.input_ids is None
 
 
-def test_forward_context_resolves_inputs_and_isolates_sampling_info(
+def test_forward_context_resolves_inputs_without_copying_sampling_info(
     monkeypatch,
 ) -> None:
     bridge, _ = _make_bridge()
@@ -75,8 +75,8 @@ def test_forward_context_resolves_inputs_and_isolates_sampling_info(
         copy_for_forward=lambda: "forward-only-sampling-info"
     )
     batch = SimpleNamespace(
-        spec_algorithm=_SpecAlgorithm(_FutureMap()),
         sampling_info=original_sampling_info,
+        mix_running_indices=None,
     )
     seen = []
 
@@ -89,55 +89,58 @@ def test_forward_context_resolves_inputs_and_isolates_sampling_info(
     )
 
     with bridge.forward_context(batch):
-        assert batch.sampling_info == "forward-only-sampling-info"
+        assert batch.sampling_info is original_sampling_info
 
     assert seen == [(batch, bridge.future_map)]
     assert batch.sampling_info is original_sampling_info
 
 
-def test_overlap_fences_scheduler_on_graph_read_done_event(monkeypatch) -> None:
-    class _ScheduleStream:
-        def __init__(self) -> None:
-            self.waited_event = None
-            self.waited_stream = None
+def test_forward_context_isolates_sampling_info_for_lookahead(monkeypatch) -> None:
+    bridge, _ = _make_bridge()
+    original_sampling_info = SimpleNamespace(
+        copy_for_forward=lambda: "forward-only-sampling-info"
+    )
+    batch = SimpleNamespace(
+        sampling_info=original_sampling_info,
+        mix_running_indices=None,
+    )
+    monkeypatch.setattr(
+        "sglang.srt.managers.overlap_utils.resolve_forward_inputs",
+        lambda *_args: None,
+    )
 
-        def wait_event(self, event) -> None:
-            self.waited_event = event
+    with bridge.forward_context(batch, isolate_sampling=True):
+        assert batch.sampling_info == "forward-only-sampling-info"
 
-        def wait_stream(self, stream) -> None:
-            self.waited_stream = stream
+    assert batch.sampling_info is original_sampling_info
 
-    class _DeviceModule:
-        @staticmethod
-        def stream(stream):
-            del stream
-            return nullcontext()
 
+def test_forward_context_resolves_mixed_prefill(monkeypatch) -> None:
+    bridge, _ = _make_bridge()
+    batch = SimpleNamespace(
+        sampling_info=None,
+        mix_running_indices=torch.tensor([1]),
+    )
+    resolved = []
+    monkeypatch.setattr(
+        "sglang.srt.managers.overlap_utils.resolve_forward_inputs",
+        lambda *_args: resolved.append(True),
+    )
+
+    with bridge.forward_context(batch):
+        pass
+
+    assert resolved == [True]
+
+
+def test_execution_bridge_rejects_speculative_decoding() -> None:
     future_map = _FutureMap()
-    read_done = object()
-    forward_stream = object()
-    runner = SimpleNamespace(
-        forward_stream=forward_stream,
-        war_fastpath_read_done_event=read_done,
-    )
-    monkeypatch.setattr(torch, "get_device_module", lambda device: _DeviceModule())
-    bridge = SGLangExecutionBridge(
-        device=torch.device("cuda"),
-        worker=SimpleNamespace(model_runner=runner),
-        req_to_token_pool="pool",
-        spec_algorithm=SimpleNamespace(
-            create_future_map=lambda *args, **kwargs: future_map
-        ),
-        enable_stream_overlap=True,
-    )
-    schedule_stream = _ScheduleStream()
-    bridge.schedule_stream = schedule_stream
+    worker = SimpleNamespace(model_runner=SimpleNamespace())
 
-    bridge.before_schedule()
-
-    assert schedule_stream.waited_event is read_done
-    assert schedule_stream.waited_stream is None
-    assert runner.war_fastpath_read_done_event is None
-
-    bridge.before_schedule()
-    assert schedule_stream.waited_stream is forward_stream
+    with pytest.raises(NotImplementedError, match="speculative decoding"):
+        SGLangExecutionBridge(
+            device=torch.device("cpu"),
+            worker=worker,
+            req_to_token_pool="pool",
+            spec_algorithm=_SpecAlgorithm(future_map, is_none=False),
+        )

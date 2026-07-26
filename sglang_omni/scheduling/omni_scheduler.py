@@ -21,7 +21,6 @@ import types
 from array import array
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import nullcontext
 from typing import Any, Callable
 
 import torch
@@ -374,14 +373,6 @@ class OmniScheduler:
                 worker=tp_worker,
                 req_to_token_pool=req_to_token_pool,
                 spec_algorithm=self.spec_algorithm,
-                # Omni async decode is deliberately a single-stream
-                # launch-current/resolve-previous loop.  SGLang's independent
-                # schedule/forward streams have a different WAR and sampling
-                # publication contract; opting into them here races decode
-                # CUDA-graph buffers even though eager decode appears correct.
-                # Only the upstream-style overlap loop owns that two-stream
-                # contract.
-                enable_stream_overlap=enable_overlap,
             )
             # Keep the upstream attribute available to delegated scheduler
             # methods, but make the custom ModelRunner the sole owner of relay.
@@ -443,6 +434,37 @@ class OmniScheduler:
         self._dirty_deferred_request_ids: set[str] = set()
         self._first_emit_done: set[str] = set()
         self._prefill_start_done: set[str] = set()
+
+    def bind_model_runner(self, model_runner: Any) -> None:
+        """Attach a custom runner and its SGLang execution-contract bridge.
+
+        Some pipelines need the scheduler-owned outbox before they can build
+        their model runner. They must use this method instead of assigning
+        ``_model_runner`` so late-bound runners receive the same execution
+        bridge and FutureMap contract as runners supplied to ``__init__``.
+        """
+        if model_runner is None:
+            raise ValueError("model_runner must not be None")
+        if self._model_runner is model_runner and self._execution_bridge is not None:
+            return
+        if self._model_runner is not None:
+            raise RuntimeError("OmniScheduler model runner is already bound")
+
+        from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
+
+        bridge = SGLangExecutionBridge(
+            device=torch.device(self.device),
+            worker=self.tp_worker,
+            req_to_token_pool=self.req_to_token_pool,
+            spec_algorithm=self.spec_algorithm,
+        )
+        model_runner._async_enabled = self.enable_async_decode
+        model_runner.bind_execution_bridge(bridge)
+        # Keep the upstream attribute available to delegated scheduler methods,
+        # but make the custom ModelRunner the sole owner of relay.
+        self._model_runner = model_runner
+        self._execution_bridge = bridge
+        self.future_map = bridge.future_map
 
     def _init_upstream_compat_flags(self, server_args: Any) -> None:
         self.enable_hisparse = bool(server_args.enable_hisparse)
@@ -1098,6 +1120,7 @@ class OmniScheduler:
             # SGLANG_TEST_RETRACT fires every step. Only the custom-runner path
             # needs it (the fallback reaches upstream run_batch, which counts).
             self.forward_ct = getattr(self, "forward_ct", 0) + 1
+            batch.forward_iter = self.forward_ct
             sched_output = self._build_sched_output(batch)
             mr_output = self._model_runner.execute(sched_output)
             self._emit_stream_output(sched_output, mr_output)
@@ -1139,9 +1162,9 @@ class OmniScheduler:
         ``_event_loop_async_decode``, which run ``process_batch_result`` in the
         same iteration as the forward. It does NOT hold on
         ``_event_loop_overlap``, where the decrement lags one iteration and a
-        final chunk would still read as a middle one; that loop is unreachable
-        today (``enable_overlap`` defaults False and no construction site sets
-        it) and would need its own drain before this publish.
+        final chunk would still read as a middle one; that loop therefore
+        refuses to run (NotImplementedError at entry) and would need its own
+        result-queue drain before this publish if ever enabled.
         """
         for req in batch.reqs:
             req.is_chunked = int(req.inflight_middle_chunks)
@@ -1217,6 +1240,7 @@ class OmniScheduler:
         # One forward per launch; mirror upstream run_batch's per-forward
         # counter (the matching resolve does no forward, so it must not count).
         self.forward_ct = getattr(self, "forward_ct", 0) + 1
+        batch.forward_iter = self.forward_ct
         sched_output = self._build_sched_output(batch)
         pending_step = self._model_runner.execute_launch(sched_output)
         return sched_output, pending_step
@@ -1361,17 +1385,12 @@ class OmniScheduler:
         self._scheduler_thread_id = threading.get_ident()
         self._running = True
         try:
-            bridge = self.__dict__.get("_execution_bridge")
-            loop_context = (
-                bridge.loop_context() if bridge is not None else nullcontext()
-            )
-            with loop_context:
-                if getattr(self, "enable_async_decode", False):
-                    self._event_loop_async_decode()
-                elif self.enable_overlap:
-                    self._event_loop_overlap()
-                else:
-                    self._event_loop_normal()
+            if getattr(self, "enable_async_decode", False):
+                self._event_loop_async_decode()
+            elif self.enable_overlap:
+                self._event_loop_overlap()
+            else:
+                self._event_loop_normal()
         finally:
             self._scheduler_thread_id = None
             try:
@@ -1960,54 +1979,22 @@ class OmniScheduler:
                 self.self_check_during_busy()
 
     def _event_loop_overlap(self) -> None:
-        self.result_queue = deque()
-
-        def pop_and_process():
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
-
-        while self._running:
-            self._process_admin_requests()
-            recv_reqs = self.recv_requests()
-            recv_reqs.extend(self._take_deferred_request_payloads())
-            self.process_input_requests(recv_reqs)
-            if self._engine_paused:
-                self._process_admin_requests()
-                time.sleep(0.001)
-                continue
-
-            bridge = self.__dict__.get("_execution_bridge")
-            if bridge is not None:
-                bridge.before_schedule()
-            batch = self.get_next_batch_to_run()
-            self.cur_batch = batch
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
-
-            if disable_overlap_for_batch and self.result_queue:
-                pop_and_process()
-
-            if batch:
-                batch_result = self.run_batch(batch)
-                if batch_result is not _FAILED_BATCH_RESULT:
-                    self.result_queue.append((batch.copy(), batch_result))
-                else:
-                    batch_result = None
-            else:
-                batch_result = None
-
-            if self.last_batch:
-                if not disable_overlap_for_batch and self.result_queue:
-                    pop_and_process()
-            elif batch is None:
-                self.self_check_during_idle()
-                time.sleep(0.001)
-
-            if self.is_generation:
-                self.launch_batch_sample_if_needed(batch_result)
-
-            self.last_batch = batch
-            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.self_check_during_busy()
+        # ``_sync_legacy_is_chunked`` republishes ``inflight_middle_chunks``
+        # under a same-iteration ``process_batch_result`` contract. On this
+        # loop the decrement lags one iteration, so a final prefill chunk
+        # still reads as a middle chunk at forward time and the TTS model
+        # runners emit wrong chunk boundaries — silently. No construction
+        # site enables overlap today; refuse to run rather than corrupt
+        # chunked prefill if one ever does.
+        # The pre-guard loop body lives in git history ("Refuse the
+        # OmniScheduler overlap event loop"); reviving it needs that drain,
+        # not just deleting this raise.
+        raise NotImplementedError(
+            "OmniScheduler's overlap event loop is unsupported: the legacy "
+            "Req.is_chunked republish lags one iteration on this loop (see "
+            "_sync_legacy_is_chunked). Drain the result queue before the "
+            "forward, then remove this guard."
+        )
 
     @staticmethod
     def _batch_is_decode(batch: ScheduleBatch) -> bool:
@@ -2122,6 +2109,11 @@ class OmniScheduler:
         out_cache_loc = batch.out_cache_loc
         forward_mode = getattr(batch, "forward_mode", None)
         if forward_mode is not None and forward_mode.is_extend():
+            if getattr(batch, "mix_running_indices", None) is not None:
+                raise RuntimeError(
+                    "Omni does not support stale-row filtering for SGLang mixed "
+                    "chunked-prefill batches"
+                )
             # Note:(Wenyao Gao) extend/mixed batches carry per-token fields
             # (req i owns extend_lens[i] slots) that filter_batch leaves
             # stale; reslice them here. The asserted fields are never
@@ -2145,12 +2137,21 @@ class OmniScheduler:
                 t for i in keep for t in range(starts[i], starts[i] + lens[i])
             ]
             input_ids = batch.input_ids
+            prefill_input_ids_cpu = getattr(batch, "prefill_input_ids_cpu", None)
+            if input_ids is None and prefill_input_ids_cpu is None:
+                raise RuntimeError(
+                    "extend batch carries neither input_ids nor "
+                    "prefill_input_ids_cpu"
+                )
             prefix_lens = batch.prefix_lens
             extend_logprob_start_lens = batch.extend_logprob_start_lens
             lp_token_ids = getattr(batch, "extend_input_logprob_token_ids", None)
             self._free_overrun_step_slots(out_cache_loc, drop_tokens)
             batch.filter_batch(keep_indices=keep)
-            batch.input_ids = input_ids[keep_tokens]
+            if input_ids is not None:
+                batch.input_ids = input_ids[keep_tokens]
+            else:
+                batch.prefill_input_ids_cpu = prefill_input_ids_cpu[keep_tokens]
             if out_cache_loc is not None:
                 batch.out_cache_loc = out_cache_loc[keep_tokens]
             batch.extend_lens = [lens[i] for i in keep]
@@ -2221,9 +2222,6 @@ class OmniScheduler:
             ):
                 self._resolve_pending_async()
 
-            bridge = self.__dict__.get("_execution_bridge")
-            if bridge is not None:
-                bridge.before_schedule()
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 

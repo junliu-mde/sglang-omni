@@ -848,20 +848,21 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("enable_overlap", "enable_async_decode", "expected_stream_overlap"),
+    ("enable_overlap", "enable_async_decode", "bind_late"),
     [
         (False, True, False),
-        (True, False, True),
-        (True, True, True),
+        (True, False, False),
+        (True, True, False),
+        (False, True, True),
     ],
 )
-def test_omni_scheduler_keeps_async_decode_on_single_stream(
+def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
     monkeypatch,
     enable_overlap,
     enable_async_decode,
-    expected_stream_overlap,
+    bind_late,
 ) -> None:
-    """Async lookahead must not opt into SGLang's independent two-stream loop."""
+    """Initial and late runners receive the same execution bridge contract."""
     monkeypatch.setattr(
         OmniScheduler, "_init_parallel_state", lambda self, _tp_worker: None
     )
@@ -880,8 +881,15 @@ def test_omni_scheduler_keeps_async_decode_on_single_stream(
     observed = []
 
     class _ExecutionBridge:
-        def __init__(self, **kwargs):
-            observed.append(kwargs["enable_stream_overlap"])
+        def __init__(
+            self,
+            *,
+            device,
+            worker,
+            req_to_token_pool,
+            spec_algorithm,
+        ):
+            del device, worker, req_to_token_pool, spec_algorithm
             self.future_map = object()
 
     monkeypatch.setattr(
@@ -927,13 +935,14 @@ def test_omni_scheduler_keeps_async_decode_on_single_stream(
         token_to_kv_pool_allocator=None,
         server_args=server_args,
         model_config=SimpleNamespace(),
-        model_runner=model_runner,
+        model_runner=None if bind_late else model_runner,
         enable_overlap=enable_overlap,
         enable_async_decode=enable_async_decode,
     )
+    if bind_late:
+        scheduler.bind_model_runner(model_runner)
 
-    assert observed[0] is expected_stream_overlap
-    assert observed[1] is scheduler._execution_bridge
+    assert observed == [scheduler._execution_bridge]
     assert model_runner._async_enabled is enable_async_decode
 
 
@@ -1263,3 +1272,14 @@ def test_omni_scheduler_result_adapter_failure_emits_error_without_raise() -> No
     assert scheduler._prefill_start_done == set()
     assert request_data.prefill_input_embeds is None
     assert request_data.decode_input_embeds is None
+
+
+def test_omni_scheduler_overlap_event_loop_refuses_to_run() -> None:
+    # The overlap loop would republish legacy Req.is_chunked one iteration
+    # late (see _sync_legacy_is_chunked): a final prefill chunk still reads
+    # as a middle one at forward time. Until that loop gets its own drain it
+    # must fail loudly instead of silently corrupting chunk boundaries.
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+
+    with pytest.raises(NotImplementedError, match="overlap event loop"):
+        scheduler._event_loop_overlap()
