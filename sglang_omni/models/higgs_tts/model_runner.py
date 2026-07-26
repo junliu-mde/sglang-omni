@@ -16,6 +16,9 @@ from typing import Any
 
 import torch
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    PrefillCudaGraphRunner,
+)
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.higgs_tts.model import _flat_sampling_attr
@@ -94,9 +97,34 @@ class HiggsTTSModelRunner(ModelRunner):
                 "Higgs prefill input embeddings were not consumed by the "
                 "previous forward"
             )
-        self.model._pending_prefill_input_embeds = self._build_prefill_input_embeds(
-            forward_batch, requests
+        input_embeds = self._build_prefill_input_embeds(forward_batch, requests)
+        prefill_runner = getattr(
+            self.tp_worker.model_runner, "prefill_cuda_graph_runner", None
         )
+        if (
+            isinstance(prefill_runner, PrefillCudaGraphRunner)
+            and prefill_runner.can_run_graph(forward_batch)
+        ):
+            raw_num_tokens = input_embeds.shape[0]
+            capture_num_tokens = tuple(
+                sorted(int(size) for size in prefill_runner.capture_num_tokens)
+            )
+            static_num_tokens = next(
+                (size for size in capture_num_tokens if size >= raw_num_tokens), None
+            )
+            if static_num_tokens is None:
+                raise RuntimeError(
+                    "Higgs prefill CUDA graph accepted a batch outside its "
+                    f"capture buckets: tokens={raw_num_tokens}, "
+                    f"buckets={capture_num_tokens}"
+                )
+            if static_num_tokens > raw_num_tokens:
+                padded = input_embeds.new_zeros(
+                    (static_num_tokens, input_embeds.shape[1])
+                )
+                padded[:raw_num_tokens].copy_(input_embeds)
+                input_embeds = padded
+        self.model._pending_prefill_input_embeds = input_embeds
         forward_batch.input_embeds = None
 
     def cleanup_prefill(self, forward_batch, schedule_batch, requests):
