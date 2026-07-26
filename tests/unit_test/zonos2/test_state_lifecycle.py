@@ -111,7 +111,7 @@ def test_length_terminal_releases_pool_row_through_scheduler_result_path() -> No
     )
     req._omni_data = data
     req.output_ids.append(1)
-    req.check_finished()
+    req.update_finish_state()
     assert req.finished_reason.to_json()["type"] == "length"
 
     scheduler = object.__new__(OmniScheduler)
