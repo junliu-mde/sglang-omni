@@ -9,6 +9,7 @@ import torch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.model_runner.sglang_execution import attn_forward_context
 from sglang_omni.scheduling.messages import OutgoingMessage
 
 
@@ -511,15 +512,16 @@ class QwenTalkerModelRunner(ModelRunner):
                 dtype=model_dtype,
             )
 
-        logits_output = self.model(
-            input_ids=forward_batch.input_ids,
-            positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=input_embeds,
-            input_deepstack_embeds=input_deepstack_embeds,
-            input_deepstack_mask=input_deepstack_mask,
-            input_embeds_are_projected=input_embeds_are_projected,
-        )
+        with attn_forward_context(model_runner.attn_backend):
+            logits_output = self.model(
+                input_ids=forward_batch.input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+                input_deepstack_embeds=input_deepstack_embeds,
+                input_deepstack_mask=input_deepstack_mask,
+                input_embeds_are_projected=input_embeds_are_projected,
+            )
         return GenerationBatchResult(
             logits_output=logits_output,
             can_run_cuda_graph=False,

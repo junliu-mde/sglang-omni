@@ -521,6 +521,13 @@ def test_qwen_predictor_decode_graph_matches_eager(monkeypatch: pytest.MonkeyPat
     layer0_codes = torch.tensor([[1], [7]], dtype=torch.int, device=device)
     talker_hidden = torch.randn(2, 1, 8, device=device)
 
+    # SGLang 0.5.15 constructs nested model buffers while its outer runner is
+    # in inference mode. Replaying later from a no-grad capture must still be
+    # allowed to update those inference tensors in place.
+    with torch.inference_mode():
+        talker.code_predictor_forward(layer0_codes, talker_hidden)
+        torch.cuda.synchronize()
+
     with torch.no_grad():
         eager_codes, eager_embeds = talker._code_predictor_forward_incremental_eager(
             layer0_codes,
@@ -1500,16 +1507,16 @@ def test_rollback_decode_prep_after_skip_is_noop_for_prefill_batches() -> None:
     assert freed == []
 
 
-def test_rollback_decode_prep_after_skip_rejects_seq_lens_sum_type_change() -> None:
+def test_rollback_decode_prep_after_skip_rejects_unknown_seq_lens_sum_type() -> None:
     class FakeForwardMode:
         @staticmethod
         def is_decode() -> bool:
             return True
 
-    batch = SimpleNamespace(forward_mode=FakeForwardMode(), seq_lens_sum=None)
+    batch = SimpleNamespace(forward_mode=FakeForwardMode(), seq_lens_sum=object())
     scheduler = object.__new__(QwenTalkerScheduler)
 
-    with pytest.raises(TypeError, match="seq_lens_sum is NoneType"):
+    with pytest.raises(TypeError, match="seq_lens_sum is object"):
         scheduler._rollback_decode_prep_after_skip(batch)
 
 
@@ -1564,7 +1571,7 @@ def test_prepare_for_decode_rollback_type_contract_with_upstream(monkeypatch) ->
     )
 
     ScheduleBatch.prepare_for_decode(batch)
-    assert isinstance(batch.seq_lens_sum, int)
+    assert batch.seq_lens_sum is None
     assert int(req_to_token[2, 10]) == 123
 
     allocated = batch.out_cache_loc
@@ -1573,7 +1580,7 @@ def test_prepare_for_decode_rollback_type_contract_with_upstream(monkeypatch) ->
     scheduler.token_to_kv_pool_allocator = SimpleNamespace(free=freed.append)
     scheduler._rollback_decode_prep_after_skip(batch)
 
-    assert batch.seq_lens_sum == 10
+    assert batch.seq_lens_sum is None
     assert torch.equal(batch.seq_lens, torch.tensor([10], dtype=torch.long))
     assert batch.out_cache_loc is None
     assert len(freed) == 1
@@ -1922,6 +1929,39 @@ def test_projected_prefill_prefers_request_data_over_forward_embeds() -> None:
     )
 
     assert torch.equal(result._embeds, embeds)
+
+
+def test_projected_prefill_activates_sglang_forward_context() -> None:
+    from sglang.srt.model_executor.forward_context import get_forward_context
+
+    attn_backend = SimpleNamespace(init_forward_metadata=lambda _batch: None)
+    observed_backends: list[object] = []
+
+    class _Model:
+        activation_dtype = torch.float32
+
+        def __call__(self, **_kwargs):
+            observed_backends.append(get_forward_context().attn_backend)
+            return SimpleNamespace()
+
+    runner = object.__new__(QwenTalkerModelRunner)
+    runner.model = _Model()
+    runner.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(attn_backend=attn_backend)
+    )
+    forward_batch = SimpleNamespace(
+        input_ids=torch.zeros(2, dtype=torch.long),
+        positions=torch.arange(2),
+        mrope_positions=None,
+    )
+
+    runner._forward_with_input_embeds(
+        forward_batch,
+        input_embeds=torch.zeros(2, 4),
+        input_embeds_are_projected=True,
+    )
+
+    assert observed_backends == [attn_backend]
 
 
 def test_projected_prefill_rejects_mixed_projected_and_list_batch() -> None:
