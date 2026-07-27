@@ -41,11 +41,10 @@ def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
 
     assert stages_by_name["tts_engine"].stream_to == ["vocoder"]
     assert "server_args_overrides" not in stages_by_name["tts_engine"].factory_args
-    assert stages_by_name["vocoder"].factory_args["compile_decode"] is True
-    assert (
+    assert stages_by_name["vocoder"].factory_args["compile_decode"] is False
+    assert stages_by_name["vocoder"].factory_args[
         "decode_cuda_graph_frame_counts"
-        not in stages_by_name["vocoder"].factory_args
-    )
+    ] == tuple(range(1, 151))
     assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
 
 

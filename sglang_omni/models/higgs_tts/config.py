@@ -88,7 +88,15 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             name="vocoder",
             process="vocoder",
             factory=f"{_PKG}.stages.create_vocoder_executor",
-            factory_args={"device": "cuda", "compile_decode": True},
+            factory_args={
+                "device": "cuda",
+                "compile_decode": False,
+                # Before the steady cursor is established, a decode window is
+                # bounded by the default 75-row stride plus its 75-row
+                # follow-up. Capture that complete finite domain so terminal
+                # flushes cannot silently fall back to eager execution.
+                "decode_cuda_graph_frame_counts": tuple(range(1, 151)),
+            },
             gpu=0,
             runtime=StageRuntimeConfig(
                 resources=StageResourceConfig(total_gpu_memory_fraction=0.10)
@@ -109,13 +117,11 @@ class HiggsTtsPipelineConfig(PipelineConfig):
                 int(factory_args.get("max_concurrency", _PREPROCESS_MAX_WORKERS)),
                 1,
             )
-            # All four stages share one pipeline process, so the preprocessing
-            # pool's tokenize/resample/delay-pattern work competes with the
-            # tts_engine scheduler thread for the GIL, and any CPU torch op
-            # otherwise spawns a machine-sized OMP team under the cgroup CPU
-            # quota. Unbounded, arrival bursts stall the scheduler mid-prefill
-            # and inflate the streaming TTFC tail. The env must be in place
-            # before the spawned stage process imports Torch.
+            # The frontend uses a bounded preprocessing pool, but its CPU torch
+            # work can still spawn a machine-sized OMP team under a cgroup CPU
+            # quota and contend with the separately spawned AR and vocoder
+            # processes. The env must be in place before stage processes import
+            # Torch.
             self.env_defaults["OMP_NUM_THREADS"] = str(
                 bounded_intraop_threads(
                     worker_count=preprocess_workers,
