@@ -194,6 +194,11 @@ class HiggsAudioCodec:
 
     @torch.no_grad()
     def capture_decode_cuda_graphs(self, frame_counts: tuple[int, ...]) -> None:
+        """Capture and publish decode graphs while decode is quiescent."""
+        with self._decode_single_flight_lock:
+            self._capture_decode_cuda_graphs_locked(frame_counts)
+
+    def _capture_decode_cuda_graphs_locked(self, frame_counts: tuple[int, ...]) -> None:
         """Capture fixed-shape single-item codec decode graphs at startup.
 
         Higgs' streaming cursor has a finite set of single-item decode-window
@@ -270,10 +275,8 @@ class HiggsAudioCodec:
         torch.cuda.synchronize(self.device)
         self._decode_cuda_graphs = captured
         logger.info(
-            "Captured %d Higgs codec decode CUDA graphs for frame counts %d..%d",
-            len(captured),
-            min(captured),
-            max(captured),
+            f"Captured {len(captured)} Higgs codec decode CUDA graphs for "
+            f"frame counts {min(captured)}..{max(captured)}"
         )
 
     @torch.no_grad()
@@ -361,11 +364,8 @@ class HiggsAudioCodec:
     @torch.no_grad()
     def decode(self, codes_TN: torch.Tensor) -> torch.Tensor:
         """``[T, num_codebooks]`` → mono waveform ``[L]``."""
-        self._acquire_decode_single_flight()
-        try:
+        with self._decode_single_flight_lock:
             return self._decode_one(codes_TN)
-        finally:
-            self._decode_single_flight_lock.release()
 
     def _decode_one(self, codes_TN: torch.Tensor) -> torch.Tensor:
         if codes_TN.ndim != 2:
@@ -394,9 +394,8 @@ class HiggsAudioCodec:
                 if frame_count not in self._decode_cuda_graph_missed_shapes:
                     self._decode_cuda_graph_missed_shapes.add(frame_count)
                     logger.warning(
-                        "Higgs codec decode CUDA graph miss for frame count %d; "
-                        "using eager decode",
-                        frame_count,
+                        f"Higgs codec decode CUDA graph miss for frame count "
+                        f"{frame_count}; using eager decode"
                     )
             audio = self.model.decode(
                 codes_BNT.to(device=self.device, dtype=torch.long)
@@ -406,25 +405,17 @@ class HiggsAudioCodec:
         )
         if decode_graphs and total_graph_lookups % 1024 == 0:
             logger.info(
-                "Higgs codec decode CUDA graph stats: hits=%d misses=%d",
-                self._decode_cuda_graph_hits,
-                self._decode_cuda_graph_misses,
+                f"Higgs codec decode CUDA graph stats: "
+                f"hits={self._decode_cuda_graph_hits} "
+                f"misses={self._decode_cuda_graph_misses}"
             )
         return audio.squeeze(0).squeeze(0).cpu()
-
-    def _acquire_decode_single_flight(self) -> None:
-        if not self._decode_single_flight_lock.acquire(blocking=False):
-            raise RuntimeError(
-                "Higgs codec decode is single-flight because its CUDA graphs "
-                "share a memory pool"
-            )
 
     @torch.no_grad()
     def decode_batch(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:
         """Batch-decode variable-length ``[T_i, N]`` tensors into ``[L_i]`` waveforms."""
         if not codes_list:
             return []
-        self._acquire_decode_single_flight()
 
         def _batch_fn(batch_items: list[torch.Tensor]) -> list[torch.Tensor]:
             stacked = torch.stack(batch_items)
@@ -432,7 +423,7 @@ class HiggsAudioCodec:
             audio = self.model.decode(codes_BNT).audio_values.cpu()
             return [audio[j, 0] for j in range(len(batch_items))]
 
-        try:
+        with self._decode_single_flight_lock:
             return self._bucketed_batch(
                 codes_list,
                 bucket_key_fn=lambda c: c.shape[0],
@@ -440,8 +431,6 @@ class HiggsAudioCodec:
                 batch_fn=_batch_fn,
                 error_label="decode_batch",
             )
-        finally:
-            self._decode_single_flight_lock.release()
 
 
 __all__ = ["HiggsAudioCodec"]

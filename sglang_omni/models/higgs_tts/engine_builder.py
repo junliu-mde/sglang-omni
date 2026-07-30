@@ -230,9 +230,9 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
                 f"captured={captured_shapes}"
             )
         logger.info(
-            "Higgs prefill CUDA graph active: backend=%s shapes=%s",
-            server_args.cuda_graph_config.prefill.backend,
-            server_args.cuda_graph_config.prefill.bs,
+            f"Higgs prefill CUDA graph active: "
+            f"backend={server_args.cuda_graph_config.prefill.backend} "
+            f"shapes={server_args.cuda_graph_config.prefill.bs}"
         )
 
     def get_model_buffer_bs(self, model: Any) -> int | None:
@@ -246,8 +246,8 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         return model_runner_mod.HiggsTTSModelRunner(model_worker, output_proc)
 
     def make_adapters(self, model: Any) -> tuple[Any, Any]:
+        del model
         return request_builders.make_higgs_scheduler_adapters(
-            model,
             max_new_tokens_cap=self.max_new_tokens,
             stream_stride=self.stream_stride,
             stream_followup_stride=self.stream_followup_stride,
@@ -255,6 +255,10 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         )
 
     def make_abort_callback(self) -> Any | None:
+        assert self.model is not None
+        return self.model.reset_request
+
+    def make_request_finished_callback(self) -> Any | None:
         assert self.model is not None
         return self.model.reset_request
 
