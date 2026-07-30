@@ -26,6 +26,7 @@ from typing import Any, Callable
 import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
@@ -59,6 +60,9 @@ _FAILED_BATCH_RESULT = object()
 
 _ABORTED_REQUEST_ID_LIMIT = 10000
 _ABORTED_REQUEST_ID_RETAINED = 5000
+_COMPLETED_REQUEST_ID_LIMIT = 10000
+_PENDING_STREAM_REQUEST_LIMIT = 10000
+_PENDING_STREAM_REQUEST_RETAINED = 5000
 
 
 def _detach_request_data(req: Any) -> None:
@@ -71,6 +75,42 @@ class _NoOpSender:
 
     def send_output(self, *args, **kwargs):
         pass
+
+
+class _UpstreamAbortSender:
+    """Translate upstream scheduler abort notifications into stage output."""
+
+    def __init__(self, scheduler: OmniScheduler) -> None:
+        self._scheduler = scheduler
+
+    def send_output(self, msg: Any, req: Any = None) -> None:
+        del req
+        if not isinstance(msg, AbortReq):
+            raise RuntimeError(
+                f"Unexpected upstream scheduler IPC output: {type(msg).__name__}"
+            )
+
+        request_id = msg.rid
+        finished_reason = msg.finished_reason
+        message = (
+            finished_reason.get("message")
+            if isinstance(finished_reason, dict)
+            else None
+        )
+        if message is None:
+            message = msg.abort_message or "Request aborted by the scheduler"
+
+        scheduler = self._scheduler
+        scheduler._emit_request_error(request_id, RuntimeError(message))
+        scheduler.abort(request_id, defer_running_cleanup=False)
+
+
+class _OmniIpcChannels:
+    """Subset of upstream SchedulerIpcChannels reachable from Omni."""
+
+    def __init__(self, scheduler: OmniScheduler) -> None:
+        self.send_to_tokenizer = _UpstreamAbortSender(scheduler)
+        self.send_to_detokenizer = scheduler.send_to_detokenizer
 
 
 class _NoOpGrammarManager:
@@ -127,6 +167,7 @@ class OmniScheduler:
         stream_chunk_handler: Callable | None = None,
         stream_done_handler: Callable | None = None,
         abort_callback: Callable[[str], None] | None = None,
+        request_finished_callback: Callable[[str], None] | None = None,
         enable_overlap: bool = False,
         enable_async_decode: bool = False,
         async_decode_min_batch_size: int = 2,
@@ -149,6 +190,7 @@ class OmniScheduler:
         self._stream_chunk_handler = stream_chunk_handler
         self._stream_done_handler = stream_done_handler
         self._abort_callback = abort_callback
+        self._request_finished_callback = request_finished_callback
         self._shutdown_callback = shutdown_callback
         self._shutdown_lock = threading.Lock()
         self._request_admission_lock = threading.RLock()
@@ -411,6 +453,7 @@ class OmniScheduler:
         self.send_to_detokenizer = _NoOpSender()
 
         self._init_parallel_state(tp_worker)
+        self.ipc_channels = _OmniIpcChannels(self)
         self.init_metrics_collector(self.tp_rank, self.pp_rank, self.dp_rank)
         self.init_metrics_reporter(self.tp_rank, self.pp_rank, self.dp_rank)
         self._init_upstream_scheduler_components()
@@ -418,6 +461,10 @@ class OmniScheduler:
         self._running = False
         self._aborted_request_ids: set[str] = set()
         self._aborted_request_id_order: deque[str] = deque()
+        # Normal completion closes stream ingress for the request. Keep a
+        # bounded tombstone window so chunks already in transport cannot turn
+        # back into pre-admission state after Req ownership is released.
+        self._completed_request_ids: dict[str, None] = {}
         self._pending_stream_chunks: dict[str, list[Any]] = {}
         self._pending_stream_done: set[str] = set()
         self._deferred_request_payloads: dict[str, Any] = {}
@@ -715,6 +762,7 @@ class OmniScheduler:
                 continue
 
             if msg.type == "new_request":
+                self._completed_request_ids.pop(msg.request_id, None)
                 new_reqs.append(msg.data)
             elif msg.type == "stream_chunk":
                 self._on_stream_chunk(msg.request_id, msg.data)
@@ -954,6 +1002,7 @@ class OmniScheduler:
                 event_name="scheduler_queue_enter",
             )
             req._coalesce_enqueue_t = time.perf_counter()
+            req._omni_terminal_claimed = False
             req._omni_data = req_data
             self.waiting_queue.append(req)
 
@@ -1272,64 +1321,82 @@ class OmniScheduler:
             rid = req.rid
             data = None
             with self._request_admission_lock:
-                is_aborted = rid in self._aborted_request_ids
+                is_aborted = isinstance(req.finished_reason, FINISH_ABORT) or (
+                    rid in self._aborted_request_ids
+                )
                 if not is_aborted:
+                    if req._omni_terminal_claimed:
+                        continue
                     data = req._omni_data
                     if data is None:
-                        raise RuntimeError(
-                            f"Terminal request {rid!r} has no scheduler request data"
+                        logger.error(
+                            f"OmniScheduler: terminal request {rid!r} has no "
+                            "request data; dropping a stale terminal alias"
                         )
-                    _detach_request_data(req)
+                        self._close_completed_request(req)
+                        continue
+                    # Abort may run from the stage listener thread. Claiming the
+                    # terminal request under the shared lock makes normal
+                    # terminalization its sole cleanup owner without hiding
+                    # request data from stream ingress before cleanup finishes.
+                    req._omni_terminal_claimed = True
 
             if is_aborted:
                 # note (Gaokai): an abort landing mid-step finishes here via
                 # FINISH_ABORT; run the cleanup abort() deferred (callbacks are
                 # idempotent) and drop the stale terminal result so it cannot
                 # resurrect the request downstream.
-                if self._abort_callback is not None:
-                    try:
-                        self._abort_callback(rid)
-                    except Exception:
-                        logger.exception(
-                            "OmniScheduler: abort cleanup failed for %s", rid
-                        )
+                self._run_abort_callback(rid)
                 self._first_emit_done.discard(rid)
                 self._prefill_start_done.discard(rid)
                 _detach_request_data(req)
                 continue
 
-            # Build result payload from the Req
-            # Drain runner stream buffers before the terminal payload; both use
-            # this outbox, so the remaining chunks stay ahead of stream done.
-            model_runner = self._model_runner
-            if model_runner is not None:
-                model_runner.on_request_finished(rid, data)
-            data.output_ids = list(req.output_ids)
-            data.weight_version = self.server_args.weight_version
-            finished_reason = req.finished_reason
-            data.finish_reason = (
-                finished_reason.to_json().get("type")
-                if finished_reason is not None
-                else None
-            )
+            result = None
+            terminal_error = None
             try:
+                # Drain runner stream buffers before the terminal payload; both
+                # use this outbox, so remaining chunks stay ahead of stream done.
+                model_runner = self._model_runner
+                if model_runner is not None:
+                    model_runner.on_request_finished(rid, data)
+                data.output_ids = list(req.output_ids)
+                data.weight_version = self.server_args.weight_version
+                finished_reason = req.finished_reason
+                data.finish_reason = (
+                    finished_reason.to_json().get("type")
+                    if finished_reason is not None
+                    else None
+                )
                 self._flush_stream_output(rid, data)
                 result = self._result_adapter(data)
             except Exception as exc:
+                terminal_error = exc
                 logger.exception(
                     "OmniScheduler terminal output handling failed for request %s",
                     rid,
                 )
-                self._first_emit_done.discard(rid)
-                self._prefill_start_done.discard(rid)
-                self._emit_request_error(rid, exc)
-                continue
             finally:
+                callback = self._request_finished_callback
+                if callback is not None:
+                    try:
+                        callback(rid)
+                    except Exception as exc:
+                        logger.exception(
+                            f"OmniScheduler: terminal cleanup failed for {rid}"
+                        )
+                        if terminal_error is None:
+                            terminal_error = exc
                 data.prefill_input_embeds = None
                 data.decode_input_embeds = None
+                abort_cleanup_needed = self._close_completed_request(req)
 
-            self._first_emit_done.discard(rid)
-            self._prefill_start_done.discard(rid)
+            if abort_cleanup_needed:
+                self._run_abort_callback(rid)
+
+            if terminal_error is not None:
+                self._emit_request_error(rid, terminal_error)
+                continue
             self.outbox.put(
                 OutgoingMessage(
                     request_id=rid,
@@ -1338,15 +1405,14 @@ class OmniScheduler:
                 )
             )
 
-    def send_to_tokenizer(self):
-        """No-op — results are routed through the stage outbox."""
-        return None
-
     def _on_stream_chunk(self, request_id: str, chunk: Any) -> None:
+        if request_id in self._completed_request_ids:
+            return
         req_data = self._find_request_data(request_id)
         if req_data is not None:
             self._append_stream_chunk(req_data, chunk)
             return
+        self._reserve_pending_stream_request(request_id)
         self._pending_stream_chunks.setdefault(request_id, []).append(chunk)
         if (
             request_id in self._deferred_request_payloads
@@ -1355,10 +1421,13 @@ class OmniScheduler:
             self._dirty_deferred_request_ids.add(request_id)
 
     def _on_stream_done(self, request_id: str) -> None:
+        if request_id in self._completed_request_ids:
+            return
         req_data = self._find_request_data(request_id)
         if req_data is not None:
             self._mark_stream_done(req_data)
             return
+        self._reserve_pending_stream_request(request_id)
         self._pending_stream_done.add(request_id)
         if request_id in self._deferred_request_payloads:
             self._dirty_deferred_request_ids.add(request_id)
@@ -1438,13 +1507,8 @@ class OmniScheduler:
                 else:
                     waiting_queue.append(req)
             self.waiting_queue = waiting_queue
-        if self._abort_callback is not None and not running_abort:
-            try:
-                self._abort_callback(request_id)
-            except Exception:
-                logger.exception(
-                    "OmniScheduler: abort cleanup failed for %s", request_id
-                )
+        if not running_abort:
+            self._run_abort_callback(request_id)
         self._pending_stream_chunks.pop(request_id, None)
         self._pending_stream_done.discard(request_id)
         self._deferred_request_payloads.pop(request_id, None)
@@ -1899,11 +1963,27 @@ class OmniScheduler:
                 continue
             seen.add(id(batch))
             for req in batch.reqs:
-                if req.rid != request_id or req.finished() or req.is_retracted:
+                if req.rid != request_id:
+                    continue
+                if req._omni_terminal_claimed:
+                    # stream_output already owns final cleanup for this request.
+                    if req._omni_data is not None:
+                        marked = True
+                    continue
+                if req.finished() or req.is_retracted:
                     continue
                 req.to_finish = FINISH_ABORT()
                 marked = True
         return marked
+
+    def _run_abort_callback(self, request_id: str) -> None:
+        callback = self._abort_callback
+        if callback is None:
+            return
+        try:
+            callback(request_id)
+        except Exception:
+            logger.exception("OmniScheduler: abort cleanup failed for %s", request_id)
 
     def _release_immediate_request_resources(self, request_id: str) -> None:
         seen: set[int] = set()
@@ -2263,9 +2343,60 @@ class OmniScheduler:
         for msg in retained:
             self.inbox.put(msg)
 
+    def _remember_completed_request(self, request_id: str) -> None:
+        if request_id in self._completed_request_ids:
+            return
+        if len(self._completed_request_ids) >= _COMPLETED_REQUEST_ID_LIMIT:
+            del self._completed_request_ids[next(iter(self._completed_request_ids))]
+        self._completed_request_ids[request_id] = None
+        self._pending_stream_chunks.pop(request_id, None)
+        self._pending_stream_done.discard(request_id)
+
+    def _reserve_pending_stream_request(self, request_id: str) -> None:
+        if (
+            request_id in self._pending_stream_chunks
+            or request_id in self._pending_stream_done
+        ):
+            return
+        pending_count = len(
+            self._pending_stream_chunks.keys() | self._pending_stream_done
+        )
+        if pending_count < _PENDING_STREAM_REQUEST_LIMIT:
+            return
+
+        evict_count = pending_count - _PENDING_STREAM_REQUEST_RETAINED + 1
+        pending_ids = iter(
+            self._pending_stream_chunks.keys() | self._pending_stream_done
+        )
+        evicted_ids = [next(pending_ids) for _ in range(evict_count)]
+        for stale_request_id in evicted_ids:
+            self._pending_stream_chunks.pop(stale_request_id, None)
+            self._pending_stream_done.discard(stale_request_id)
+        logger.warning(
+            "OmniScheduler evicted %d pending stream request(s) after reaching "
+            "the %d-request limit",
+            len(evicted_ids),
+            _PENDING_STREAM_REQUEST_LIMIT,
+        )
+
+    def _close_completed_request(self, req: Any) -> bool:
+        request_id = req.rid
+        with self._request_admission_lock:
+            _detach_request_data(req)
+            self._remember_completed_request(request_id)
+            abort_cleanup_needed = request_id in self._aborted_request_ids
+        self._first_emit_done.discard(request_id)
+        self._prefill_start_done.discard(request_id)
+        return abort_cleanup_needed
+
     def _find_request_data(self, request_id: str) -> Any | None:
         # Scan all batches a live req can sit in during prefill→decode handoff.
-        for batch in (self.running_batch, self.cur_batch, self.last_batch):
+        for batch in (
+            self.running_batch,
+            self.cur_batch,
+            self.last_batch,
+            self._async_pending_batch(),
+        ):
             if batch is None:
                 continue
             for req in batch.reqs:
