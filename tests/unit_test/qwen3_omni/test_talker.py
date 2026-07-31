@@ -1228,8 +1228,7 @@ def _build_state_machine_scheduler(
     scheduler._enable_partial_start = enable_partial_start
     scheduler._partial_start_min_chunks = partial_start_min_chunks
     scheduler._im_end_token_id = None
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._completed_request_ids = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
@@ -1292,7 +1291,7 @@ def test_process_input_requests_partial_build_state_machine() -> None:
     built = scheduler.waiting_queue[0]._omni_data
     assert built._captured_thinker_done is False
     assert "rid-partial-1" not in scheduler._deferred_request_payloads
-    assert "rid-partial-1" not in scheduler._pending_stream_done
+    assert "rid-partial-1" not in scheduler._pending_stream_ingress
     assert appended == []
     assert marked_done == [False]
 
@@ -1349,7 +1348,7 @@ def test_deferred_request_payload_ignores_chunks_when_partial_disabled() -> None
         scheduler, "rid-disabled", SimpleNamespace(data=torch.tensor([1.0]))
     )
 
-    assert scheduler._pending_stream_chunks["rid-disabled"]
+    assert scheduler._pending_stream_ingress["rid-disabled"].chunks
     assert scheduler._dirty_deferred_request_ids == set()
     assert OmniScheduler._take_deferred_request_payloads(scheduler) == []
 
@@ -1371,8 +1370,7 @@ def test_abort_filters_subsequent_stream_messages_via_recv_requests() -> None:
     scheduler = object.__new__(QwenTalkerScheduler)
     scheduler._aborted_request_ids = set()
     scheduler._aborted_request_id_order = deque()
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
     scheduler.waiting_queue = []

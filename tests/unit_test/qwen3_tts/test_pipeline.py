@@ -1385,8 +1385,7 @@ def test_qwen3_tts_ar_scheduler_abort_cleans_prepared_state() -> None:
         )
         scheduler._aborted_request_ids = set()
         scheduler._aborted_request_id_order = deque()
-        scheduler._pending_stream_chunks = {}
-        scheduler._pending_stream_done = set()
+        scheduler._pending_stream_ingress = {}
         scheduler._deferred_request_payloads = {}
         scheduler._dirty_deferred_request_ids = set()
         scheduler._first_emit_done = set()

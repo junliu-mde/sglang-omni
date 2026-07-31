@@ -121,8 +121,7 @@ def test_length_terminal_releases_pool_row_through_scheduler_result_path() -> No
     scheduler.outbox = Queue()
     scheduler._aborted_request_ids = set()
     scheduler._completed_request_ids = {}
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._request_finished_callback = None
     scheduler._first_emit_done = {request_id}
     scheduler._prefill_start_done = {request_id}

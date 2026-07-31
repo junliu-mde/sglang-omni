@@ -25,6 +25,15 @@ from tests.unit_test.fakes import FakeServerArgs
 from tests.unit_test.pipeline.helpers import run_scheduler
 
 
+def _ingress(
+    *chunks, done: bool = False
+) -> omni_scheduler_module._PendingStreamIngress:
+    entry = omni_scheduler_module._PendingStreamIngress()
+    entry.chunks.extend(chunks)
+    entry.done = done
+    return entry
+
+
 def _init_sync_request_build_state(scheduler: OmniScheduler) -> None:
     scheduler._request_admission_lock = threading.RLock()
     scheduler._request_build_executor = None
@@ -42,8 +51,7 @@ def _init_terminal_output_state(scheduler: OmniScheduler) -> None:
     scheduler._stream_output_builder = None
     scheduler._request_finished_callback = None
     scheduler._completed_request_ids = {}
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
 
 
 def _new_stage_payload(request_id: str) -> StagePayload:
@@ -173,8 +181,7 @@ def test_take_deferred_request_payloads_is_event_driven() -> None:
     scheduler._async_pending = None
     scheduler.waiting_queue = []
     scheduler._completed_request_ids = {}
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     payload = object()
     scheduler._deferred_request_payloads = {"req-deferred": payload}
     scheduler._dirty_deferred_request_ids = set()
@@ -192,7 +199,7 @@ def test_take_deferred_request_payloads_is_event_driven() -> None:
 
     OmniScheduler._on_stream_chunk(scheduler, "req-unknown", "chunk-x")
     assert scheduler._dirty_deferred_request_ids == set()
-    assert scheduler._pending_stream_chunks["req-unknown"] == ["chunk-x"]
+    assert scheduler._pending_stream_ingress["req-unknown"].chunks == ["chunk-x"]
     assert scheduler._take_deferred_request_payloads() == []
 
     OmniScheduler._on_stream_done(scheduler, "req-deferred")
@@ -227,8 +234,10 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
     scheduler.is_entry_rank = True
     scheduler._aborted_request_ids = set()
     scheduler._aborted_request_id_order = deque()
-    scheduler._pending_stream_chunks = {"req-1": ["stale"]}
-    scheduler._pending_stream_done = {"req-2"}
+    scheduler._pending_stream_ingress = {
+        "req-1": _ingress("stale"),
+        "req-2": _ingress(done=True),
+    }
     scheduler._deferred_request_payloads = {"req-1": object()}
     scheduler._dirty_deferred_request_ids = {"req-1"}
     scheduler._abort_callback = None
@@ -279,8 +288,7 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
     assert batch.reqs == []
     assert all(req._omni_data is None for req in failed_reqs)
     assert release_calls == [("req-1", tree_cache), ("req-2", tree_cache)]
-    assert scheduler._pending_stream_chunks == {}
-    assert scheduler._pending_stream_done == set()
+    assert scheduler._pending_stream_ingress == {}
     assert scheduler._deferred_request_payloads == {}
     assert scheduler._dirty_deferred_request_ids == set()
 
@@ -549,8 +557,7 @@ def test_omni_scheduler_abort_propagates_immediate_kv_cleanup_failure(
     scheduler._abort_callback = None
     scheduler._aborted_request_ids = set()
     scheduler._aborted_request_id_order = deque()
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
     scheduler._first_emit_done = set()
@@ -592,8 +599,7 @@ def test_omni_scheduler_abort_marks_running_request_for_finish(monkeypatch) -> N
     scheduler._aborted_request_ids = set()
     scheduler._aborted_request_id_order = deque()
     scheduler._completed_request_ids = {}
-    scheduler._pending_stream_chunks = {"req-run": ["stale"]}
-    scheduler._pending_stream_done = {"req-run"}
+    scheduler._pending_stream_ingress = {"req-run": _ingress("stale", done=True)}
     scheduler._deferred_request_payloads = {"req-run": object()}
     scheduler._dirty_deferred_request_ids = {"req-run"}
     scheduler._first_emit_done = {"req-run"}
@@ -622,8 +628,7 @@ def test_omni_scheduler_abort_marks_running_request_for_finish(monkeypatch) -> N
     assert cleaned == []
     assert release_calls == []
     assert scheduler._aborted_request_ids == {"req-run"}
-    assert scheduler._pending_stream_chunks == {}
-    assert scheduler._pending_stream_done == set()
+    assert scheduler._pending_stream_ingress == {}
     assert scheduler._deferred_request_payloads == {}
     assert scheduler._dirty_deferred_request_ids == set()
     assert scheduler._first_emit_done == set()
@@ -637,8 +642,7 @@ def test_omni_scheduler_abort_cleans_queued_request_immediately() -> None:
     scheduler._abort_callback = cleaned.append
     scheduler._aborted_request_ids = set()
     scheduler._aborted_request_id_order = deque()
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
     scheduler._first_emit_done = set()
@@ -668,8 +672,7 @@ def test_omni_scheduler_abort_treats_retracted_alias_as_waiting_owned() -> None:
     scheduler._abort_callback = cleaned.append
     scheduler._aborted_request_ids = set()
     scheduler._aborted_request_id_order = deque()
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
     scheduler._first_emit_done = set()
@@ -806,8 +809,7 @@ def test_omni_scheduler_fish_abort_during_step_suppresses_chunk_and_result() -> 
     scheduler._aborted_request_ids = set()
     scheduler._aborted_request_id_order = deque()
     scheduler._completed_request_ids = {}
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
     scheduler._first_emit_done = set()
@@ -1054,8 +1056,7 @@ def test_stream_output_atomically_claims_request_data_against_abort() -> None:
     scheduler._aborted_request_ids = set()
     scheduler._aborted_request_id_order = deque()
     scheduler._completed_request_ids = {}
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
     scheduler._first_emit_done = set()
@@ -1109,8 +1110,7 @@ def test_abort_after_terminal_close_runs_its_own_cleanup() -> None:
     scheduler._aborted_request_ids = set()
     scheduler._aborted_request_id_order = deque()
     scheduler._completed_request_ids = {}
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
     scheduler._first_emit_done = set()
@@ -1172,8 +1172,7 @@ def test_abort_publishes_request_id_before_marking_terminal_finish() -> None:
     scheduler._aborted_request_ids = set()
     scheduler._aborted_request_id_order = deque()
     scheduler._completed_request_ids = {}
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
     scheduler._first_emit_done = set()
@@ -1348,8 +1347,7 @@ def test_stream_output_closes_late_stream_ingress() -> None:
     scheduler._on_stream_done(req.rid)
 
     assert req.rid in scheduler._completed_request_ids
-    assert req.rid not in scheduler._pending_stream_chunks
-    assert req.rid not in scheduler._pending_stream_done
+    assert req.rid not in scheduler._pending_stream_ingress
 
 
 def test_completed_request_id_is_cleared_on_explicit_readmission() -> None:
@@ -1359,8 +1357,7 @@ def test_completed_request_id_is_cleared_on_explicit_readmission() -> None:
     scheduler.outbox = Queue()
     scheduler._aborted_request_ids = set()
     scheduler._completed_request_ids = {"req-complete": None}
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler.inbox = Queue()
     scheduler.inbox.put(
         IncomingMessage(
@@ -1379,7 +1376,7 @@ def test_completed_request_id_is_cleared_on_explicit_readmission() -> None:
 
 def test_pending_stream_requests_are_bounded(monkeypatch, caplog) -> None:
     monkeypatch.setattr(omni_scheduler_module, "_PENDING_STREAM_REQUEST_LIMIT", 3)
-    monkeypatch.setattr(omni_scheduler_module, "_PENDING_STREAM_REQUEST_RETAINED", 1)
+    monkeypatch.setattr(omni_scheduler_module, "_PENDING_STREAM_REQUEST_RETAINED", 2)
     scheduler = object.__new__(OmniScheduler)
     scheduler.running_batch = None
     scheduler.cur_batch = None
@@ -1387,25 +1384,25 @@ def test_pending_stream_requests_are_bounded(monkeypatch, caplog) -> None:
     scheduler._async_pending = None
     scheduler.waiting_queue = []
     scheduler._completed_request_ids = {}
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
 
     for index in range(4):
         scheduler._on_stream_chunk(f"req-{index}", index)
 
-    assert len(scheduler._pending_stream_chunks) == 1
-    assert scheduler._pending_stream_chunks["req-3"] == [3]
-    assert "evicted 3 pending stream request(s)" in caplog.text
+    # Eviction is oldest-first: the still-fresh req-2 survives alongside the
+    # arrival that triggered the eviction.
+    assert list(scheduler._pending_stream_ingress) == ["req-2", "req-3"]
+    assert scheduler._pending_stream_ingress["req-3"].chunks == [3]
+    assert "evicted 2 pending stream request(s)" in caplog.text
 
 
 def test_completed_request_tombstones_evict_oldest(monkeypatch) -> None:
     monkeypatch.setattr(omni_scheduler_module, "_COMPLETED_REQUEST_ID_LIMIT", 3)
     scheduler = object.__new__(OmniScheduler)
     scheduler._completed_request_ids = {}
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
 
     for request_id in ("r0", "r1", "r2", "r3"):
         scheduler._remember_completed_request(request_id)
@@ -1444,8 +1441,7 @@ def test_omni_scheduler_abort_caps_aborted_id_set() -> None:
     for i in range(omni_scheduler_module._ABORTED_REQUEST_ID_LIMIT):
         scheduler._aborted_request_ids.add(f"req-{i}")
         scheduler._aborted_request_id_order.append(f"req-{i}")
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
     scheduler._first_emit_done = set()
@@ -1481,8 +1477,7 @@ def test_omni_scheduler_distinguishes_queue_enter_from_prefill_start(
     scheduler = object.__new__(OmniScheduler)
     scheduler.outbox = Queue()
     scheduler.waiting_queue = []
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
     scheduler._aborted_request_ids = set()
@@ -1871,8 +1866,7 @@ def test_omni_scheduler_request_builder_errors_do_not_stop_loop() -> None:
     scheduler = object.__new__(OmniScheduler)
     scheduler.outbox = Queue()
     scheduler.waiting_queue = []
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
     scheduler._aborted_request_ids = set()
@@ -1907,8 +1901,7 @@ def test_omni_scheduler_follower_request_builder_errors_do_not_emit() -> None:
     scheduler = object.__new__(OmniScheduler)
     scheduler.outbox = Queue()
     scheduler.waiting_queue = []
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = {"req-err"}
+    scheduler._pending_stream_ingress = {"req-err": _ingress(done=True)}
     scheduler._deferred_request_payloads = {"req-err": object()}
     scheduler._dirty_deferred_request_ids = set()
     scheduler._aborted_request_ids = set()
@@ -1933,7 +1926,7 @@ def test_omni_scheduler_follower_request_builder_errors_do_not_emit() -> None:
 
     assert scheduler.outbox.empty()
     assert scheduler.waiting_queue == []
-    assert scheduler._pending_stream_done == set()
+    assert scheduler._pending_stream_ingress == {}
     assert scheduler._deferred_request_payloads == {}
 
 
@@ -1942,8 +1935,7 @@ def test_omni_scheduler_prepares_custom_request_token_budget() -> None:
     scheduler = object.__new__(OmniScheduler)
     scheduler.outbox = Queue()
     scheduler.waiting_queue = []
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
     scheduler._aborted_request_ids = set()
@@ -1980,8 +1972,7 @@ def test_omni_scheduler_rejects_custom_request_over_context() -> None:
     scheduler = object.__new__(OmniScheduler)
     scheduler.outbox = Queue()
     scheduler.waiting_queue = []
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
     scheduler._aborted_request_ids = set()
@@ -2033,8 +2024,7 @@ def test_omni_scheduler_follower_rejections_do_not_emit_errors() -> None:
     scheduler = object.__new__(OmniScheduler)
     scheduler.outbox = Queue()
     scheduler.waiting_queue = []
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
     scheduler._aborted_request_ids = set()
@@ -2098,8 +2088,7 @@ def test_omni_scheduler_leaves_request_budget_unchanged_without_opt_in() -> None
     scheduler = object.__new__(OmniScheduler)
     scheduler.outbox = Queue()
     scheduler.waiting_queue = []
-    scheduler._pending_stream_chunks = {}
-    scheduler._pending_stream_done = set()
+    scheduler._pending_stream_ingress = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
     scheduler._aborted_request_ids = set()

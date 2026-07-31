@@ -21,6 +21,7 @@ import types
 from array import array
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from itertools import islice
 from typing import Any, Callable
 
 import torch
@@ -63,6 +64,16 @@ _ABORTED_REQUEST_ID_RETAINED = 5000
 _COMPLETED_REQUEST_ID_LIMIT = 10000
 _PENDING_STREAM_REQUEST_LIMIT = 10000
 _PENDING_STREAM_REQUEST_RETAINED = 5000
+
+
+class _PendingStreamIngress:
+    """Stream input buffered for a request the scheduler has not admitted."""
+
+    __slots__ = ("chunks", "done")
+
+    def __init__(self) -> None:
+        self.chunks: list[Any] = []
+        self.done = False
 
 
 def _detach_request_data(req: Any) -> None:
@@ -465,8 +476,9 @@ class OmniScheduler:
         # bounded tombstone window so chunks already in transport cannot turn
         # back into pre-admission state after Req ownership is released.
         self._completed_request_ids: dict[str, None] = {}
-        self._pending_stream_chunks: dict[str, list[Any]] = {}
-        self._pending_stream_done: set[str] = set()
+        # Keyed by first-touch arrival: dict order lets the overload eviction
+        # drop oldest-first.
+        self._pending_stream_ingress: dict[str, _PendingStreamIngress] = {}
         self._deferred_request_payloads: dict[str, Any] = {}
         self._dirty_deferred_request_ids: set[str] = set()
         self._first_emit_done: set[str] = set()
@@ -806,14 +818,21 @@ class OmniScheduler:
                     or req_id in self._pending_request_builds
                 ):
                     continue
-            buffered_chunks = self._pending_stream_chunks.pop(req_id, [])
+            ingress = self._pending_stream_ingress.get(req_id)
+            buffered_chunks: list[Any] = []
+            if ingress is not None and ingress.chunks:
+                # Move chunks onto the payload; the entry (and its done flag)
+                # stays until the built request consumes it, so a deferred
+                # recheck re-derives prefetched_stream_done from the same spot.
+                buffered_chunks = ingress.chunks
+                ingress.chunks = []
             existing_chunks = list(payload.prefetched_chunks)
             if existing_chunks:
                 existing_chunks.extend(buffered_chunks)
                 payload.prefetched_chunks = existing_chunks
             else:
                 payload.prefetched_chunks = buffered_chunks
-            pending_stream_done = req_id in self._pending_stream_done
+            pending_stream_done = ingress.done if ingress is not None else False
             payload.prefetched_stream_done = pending_stream_done
             if not self._is_request_build_ready(
                 payload,
@@ -968,8 +987,6 @@ class OmniScheduler:
         request_admission_lock_held: bool = False,
     ) -> None:
         req_id = payload.request_id
-        if pending_stream_done:
-            self._pending_stream_done.discard(req_id)
         self._deferred_request_payloads.pop(req_id, None)
         req = req_data.req
         self._normalize_req_token_arrays(req)
@@ -987,11 +1004,12 @@ class OmniScheduler:
             self.abort(req_id)
             return
         self._initialize_request_stream_state(req_data, payload)
-        for chunk in self._pending_stream_chunks.pop(req_id, []) or []:
-            self._append_stream_chunk(req_data, chunk)
-        if req_id in self._pending_stream_done:
-            self._pending_stream_done.discard(req_id)
-            self._mark_stream_done(req_data)
+        ingress = self._pending_stream_ingress.pop(req_id, None)
+        if ingress is not None:
+            for chunk in ingress.chunks:
+                self._append_stream_chunk(req_data, chunk)
+            if ingress.done and not pending_stream_done:
+                self._mark_stream_done(req_data)
 
         def enqueue_if_live() -> None:
             if req_id in self._aborted_request_ids:
@@ -1413,7 +1431,9 @@ class OmniScheduler:
             self._append_stream_chunk(req_data, chunk)
             return
         self._reserve_pending_stream_request(request_id)
-        self._pending_stream_chunks.setdefault(request_id, []).append(chunk)
+        self._pending_stream_ingress.setdefault(
+            request_id, _PendingStreamIngress()
+        ).chunks.append(chunk)
         if (
             request_id in self._deferred_request_payloads
             and self._should_recheck_deferred_request_on_stream_chunk(request_id, chunk)
@@ -1428,7 +1448,9 @@ class OmniScheduler:
             self._mark_stream_done(req_data)
             return
         self._reserve_pending_stream_request(request_id)
-        self._pending_stream_done.add(request_id)
+        self._pending_stream_ingress.setdefault(
+            request_id, _PendingStreamIngress()
+        ).done = True
         if request_id in self._deferred_request_payloads:
             self._dirty_deferred_request_ids.add(request_id)
 
@@ -1509,8 +1531,7 @@ class OmniScheduler:
             self.waiting_queue = waiting_queue
         if not running_abort:
             self._run_abort_callback(request_id)
-        self._pending_stream_chunks.pop(request_id, None)
-        self._pending_stream_done.discard(request_id)
+        self._pending_stream_ingress.pop(request_id, None)
         self._deferred_request_payloads.pop(request_id, None)
         self._dirty_deferred_request_ids.discard(request_id)
         self._first_emit_done.discard(request_id)
@@ -2349,33 +2370,24 @@ class OmniScheduler:
         if len(self._completed_request_ids) >= _COMPLETED_REQUEST_ID_LIMIT:
             del self._completed_request_ids[next(iter(self._completed_request_ids))]
         self._completed_request_ids[request_id] = None
-        self._pending_stream_chunks.pop(request_id, None)
-        self._pending_stream_done.discard(request_id)
+        self._pending_stream_ingress.pop(request_id, None)
 
     def _reserve_pending_stream_request(self, request_id: str) -> None:
-        if (
-            request_id in self._pending_stream_chunks
-            or request_id in self._pending_stream_done
-        ):
+        pending = self._pending_stream_ingress
+        if request_id in pending:
             return
-        pending_count = len(
-            self._pending_stream_chunks.keys() | self._pending_stream_done
-        )
-        if pending_count < _PENDING_STREAM_REQUEST_LIMIT:
+        if len(pending) < _PENDING_STREAM_REQUEST_LIMIT:
             return
 
-        evict_count = pending_count - _PENDING_STREAM_REQUEST_RETAINED + 1
-        pending_ids = iter(
-            self._pending_stream_chunks.keys() | self._pending_stream_done
-        )
-        evicted_ids = [next(pending_ids) for _ in range(evict_count)]
-        for stale_request_id in evicted_ids:
-            self._pending_stream_chunks.pop(stale_request_id, None)
-            self._pending_stream_done.discard(stale_request_id)
+        # Oldest-first: stale entries go before a request that is about to be
+        # admitted.
+        evict_count = len(pending) - _PENDING_STREAM_REQUEST_RETAINED + 1
+        for stale_request_id in list(islice(pending, evict_count)):
+            del pending[stale_request_id]
         logger.warning(
             "OmniScheduler evicted %d pending stream request(s) after reaching "
             "the %d-request limit",
-            len(evicted_ids),
+            evict_count,
             _PENDING_STREAM_REQUEST_LIMIT,
         )
 
