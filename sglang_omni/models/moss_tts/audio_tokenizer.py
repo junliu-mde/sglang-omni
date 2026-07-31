@@ -10,9 +10,7 @@ import torch
 import torchaudio
 from transformers import AutoModel
 
-from sglang_omni.models.moss_tts.hf_loading import (
-    moss_transformers_processor_compat,
-)
+from sglang_omni.models.moss_tts.hf_loading import moss_transformers_processor_compat
 
 logger = logging.getLogger(__name__)
 
