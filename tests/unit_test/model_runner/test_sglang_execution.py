@@ -61,9 +61,8 @@ def test_publish_next_tokens_uses_future_map_and_retires_input_ids() -> None:
     stash_indices, payload = future_map.stashed
     assert torch.equal(stash_indices, batch.req_pool_indices)
     assert torch.equal(payload.bonus_tokens, next_token_ids)
-    publish_indices, publish_seq_lens = future_map.published
-    assert torch.equal(publish_indices, batch.req_pool_indices)
-    assert torch.equal(publish_seq_lens, torch.tensor([13, 20]))
+    # new_seq_lens_buf has no non-spec reader; the bridge must not publish.
+    assert future_map.published is None
     assert batch.input_ids is None
 
 

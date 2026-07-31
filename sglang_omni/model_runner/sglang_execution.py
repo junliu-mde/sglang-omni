@@ -113,7 +113,10 @@ class SGLangExecutionBridge:
             indices,
             self._relay_payload_type(bonus_tokens=next_token_ids),
         )
-        self.future_map.publish(indices, batch.seq_lens + 1)
+        # No new_seq_lens publish: its only reader (resolve_seq_lens_cpu) is
+        # spec_v2-gated and this bridge refuses speculative decoding. Upstream's
+        # non-overlap non-spec run_batch likewise stashes without publishing.
+
         # SGLang 0.5.15 resolves the next decode input from FutureMap at forward
         # entry. Keeping a direct tensor here reintroduces the removed 0.5.12
         # contract and is unsafe when the live batch is filtered on another
