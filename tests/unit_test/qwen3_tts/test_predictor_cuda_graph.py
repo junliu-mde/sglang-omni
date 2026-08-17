@@ -77,9 +77,6 @@ def _build_talker(device: torch.device) -> Qwen3TTSTalker:
             hidden_size=HIDDEN,
         ),
     )
-    talker._predictor_input_buffer = torch.zeros(
-        MAX_BS, predictor_len, HIDDEN, device=device, dtype=DTYPE
-    )
     positions = torch.arange(predictor_len, device=device, dtype=torch.long)
     talker._predictor_positions = positions
     talker._predictor_position_rows = (
@@ -93,6 +90,9 @@ def _build_talker(device: torch.device) -> Qwen3TTSTalker:
         MAX_BS, NUM_CODE_GROUPS, dtype=torch.long, device=device
     )
     talker._output_embeds = torch.zeros(MAX_BS, HIDDEN, device=device, dtype=DTYPE)
+    talker._predictor_embedding_buffer = torch.empty(
+        MAX_BS, HIDDEN, device=device, dtype=DTYPE
+    )
     talker._sampled_token_ids = torch.zeros(MAX_BS, dtype=torch.long, device=device)
 
     talker._sub_batch_size = 0
@@ -273,6 +273,56 @@ def test_graph_bit_identity_argmax(batch_size: int):
     graph_codes, graph_embeds = _run_forward(talker, layer0, hidden, positions)
 
     assert talker._predictor_graphs
+    assert torch.equal(graph_codes, eager_codes)
+    assert torch.equal(graph_embeds, eager_embeds)
+
+
+@pytest.mark.skipif(not _HAS_CUDA, reason="predictor CUDA graph needs CUDA")
+def test_missing_embedding_buffer_uses_original_graph_path():
+    """The captured fused path must retain the original embedding operation."""
+    device = torch.device("cuda")
+    fused_talker = _build_talker(device)
+    fallback_talker = _build_talker(device)
+    requests = _uniform_requests(4)
+    fused_talker.prepare_decode_buffers(requests)
+    fallback_talker.prepare_decode_buffers(requests)
+    object.__delattr__(fallback_talker, "_predictor_embedding_buffer")
+    layer0, hidden, positions = _step_inputs(4, device)
+
+    fused_codes, fused_embeds = _run_forward(fused_talker, layer0, hidden, positions)
+    fallback_codes, fallback_embeds = _run_forward(
+        fallback_talker, layer0, hidden, positions
+    )
+
+    assert torch.equal(fused_codes, fallback_codes)
+    assert torch.equal(fused_embeds, fallback_embeds)
+
+
+@pytest.mark.skipif(not _HAS_CUDA, reason="predictor CUDA graph needs CUDA")
+def test_fused_embedding_runs_only_during_cuda_graph_capture(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    device = torch.device("cuda")
+    talker = _build_talker(device)
+    talker.prepare_decode_buffers(_uniform_requests(2))
+    layer0, hidden, positions = _step_inputs(2, device)
+    original_kernel = sglang_model_module.gather_codec_embedding_and_add
+    calls = []
+
+    def _record_kernel(*args):
+        calls.append(None)
+        return original_kernel(*args)
+
+    monkeypatch.setattr(
+        sglang_model_module,
+        "gather_codec_embedding_and_add",
+        _record_kernel,
+    )
+    eager_codes, eager_embeds = _run_eager(talker, layer0, hidden, positions)
+    assert not calls
+
+    graph_codes, graph_embeds = _run_forward(talker, layer0, hidden, positions)
+    assert len(calls) == NUM_CODE_GROUPS - 1
     assert torch.equal(graph_codes, eager_codes)
     assert torch.equal(graph_embeds, eager_embeds)
 
