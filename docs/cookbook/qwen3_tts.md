@@ -49,6 +49,17 @@ If you hit a `TypeError` raised from inside `qwen_tts`, do not resolve it by
 installing the package's own Transformers pin — that breaks the rest of the
 runtime. Report it instead, so the shim can cover it.
 
+The current `flashinfer==0.6.14` package resolves a
+`flashinfer-cubin==0.6.15.post1` wheel. Set this environment variable before
+starting the server until matching cubin wheels are published:
+
+```bash
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+```
+
+SGLang-Omni applies the required qwen-tts mask-helper compatibility patch for
+the pinned Transformers 5.12.1 runtime during Qwen3-TTS startup.
+
 The Python `sox` package shells out to the system `sox` binary on some paths, so install both.
 
 Download a checkpoint (both repositories are public, no token required):

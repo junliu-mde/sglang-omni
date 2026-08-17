@@ -3792,6 +3792,94 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_reenables_cuda_graph(
     clear_qwen3_tts_preprocessing_context()
 
 
+def test_qwen3_tts_mask_helpers_translate_legacy_keywords(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from transformers import masking_utils
+
+    from sglang_omni.models.qwen3_tts.compat import (
+        apply_qwen_tts_transformers_compatibility_patches,
+    )
+
+    calls: list[dict[str, object]] = []
+
+    def current_mask_helper(
+        *,
+        config,
+        inputs_embeds,
+        attention_mask,
+        past_key_values,
+        position_ids=None,
+    ):
+        calls.append(
+            {
+                "config": config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+        )
+        return inputs_embeds
+
+    monkeypatch.setattr(masking_utils, "create_causal_mask", current_mask_helper)
+    monkeypatch.setattr(
+        masking_utils,
+        "create_sliding_window_causal_mask",
+        current_mask_helper,
+    )
+
+    apply_qwen_tts_transformers_compatibility_patches()
+    causal_mask_helper = masking_utils.create_causal_mask
+    apply_qwen_tts_transformers_compatibility_patches()
+    assert masking_utils.create_causal_mask is causal_mask_helper
+
+    config = object()
+    input_embeds = object()
+    attention_mask = object()
+    past_key_values = object()
+    position_ids = object()
+
+    for name in ("create_causal_mask", "create_sliding_window_causal_mask"):
+        helper = getattr(masking_utils, name)
+        assert (
+            helper(
+                config=config,
+                input_embeds=input_embeds,
+                attention_mask=attention_mask,
+                cache_position=object(),
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+            )
+            is input_embeds
+        )
+        with pytest.raises(TypeError, match="both input_embeds and inputs_embeds"):
+            helper(
+                config=config,
+                input_embeds=input_embeds,
+                inputs_embeds=input_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+            )
+
+    assert calls == [
+        {
+            "config": config,
+            "inputs_embeds": input_embeds,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "position_ids": position_ids,
+        },
+        {
+            "config": config,
+            "inputs_embeds": input_embeds,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "position_ids": position_ids,
+        },
+    ]
+
+
 def test_qwen3_tts_engine_probes_runtime_before_checkpoint_resolution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
