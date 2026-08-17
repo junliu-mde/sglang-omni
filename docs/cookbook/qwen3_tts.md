@@ -25,6 +25,17 @@ uv pip install --no-deps qwen-tts==0.1.1
 > Do **not** install `qwen-tts` with dependencies here. Its declared dependency
 > set can pull a different Transformers/Torch stack than the SGLang-Omni runtime.
 
+The current `flashinfer==0.6.14` package resolves a
+`flashinfer-cubin==0.6.15.post1` wheel. Set this environment variable before
+starting the server until matching cubin wheels are published:
+
+```bash
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+```
+
+SGLang-Omni applies the required qwen-tts mask-helper compatibility patch for
+the pinned Transformers 5.12.1 runtime during Qwen3-TTS startup.
+
 The Python `sox` package shells out to the system `sox` binary on some paths, so install both.
 
 Download a checkpoint (both repositories are public, no token required):

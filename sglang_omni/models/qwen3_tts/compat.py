@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from functools import wraps
 import inspect
 import threading
 from typing import Any, Callable
@@ -38,13 +39,57 @@ def _compute_default_rope_parameters(
     return inv_freq, 1.0
 
 
+def _patch_mask_helper(masking_utils: Any, name: str) -> None:
+    """Adapt qwen-tts's legacy mask-helper keyword names when needed."""
+    original = getattr(masking_utils, name, None)
+    if original is None or getattr(original, _PATCHED_FLAG, False):
+        return
+
+    try:
+        signature = inspect.signature(original)
+    except (TypeError, ValueError):
+        return
+
+    parameters = signature.parameters
+    if "input_embeds" in parameters or "inputs_embeds" not in parameters:
+        return
+    accepts_cache_position = "cache_position" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+    @wraps(original)
+    def mask_helper_compat(*args: Any, **kwargs: Any) -> Any:
+        if "input_embeds" in kwargs:
+            if "inputs_embeds" in kwargs:
+                raise TypeError(
+                    f"{name} received both input_embeds and inputs_embeds"
+                )
+            kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
+        if not accepts_cache_position:
+            kwargs.pop("cache_position", None)
+        return original(*args, **kwargs)
+
+    setattr(mask_helper_compat, _PATCHED_FLAG, True)
+    setattr(masking_utils, name, mask_helper_compat)
+
+
 def apply_qwen_tts_transformers_compatibility_patches() -> None:
     """Patch Transformers APIs expected by qwen-tts."""
     from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
     from transformers.utils import generic
 
+    try:
+        from transformers import masking_utils
+    except ImportError:
+        masking_utils = None
+
     with _APPLY_LOCK:
         ROPE_INIT_FUNCTIONS.setdefault("default", _compute_default_rope_parameters)
+
+        if masking_utils is not None:
+            _patch_mask_helper(masking_utils, "create_causal_mask")
+            _patch_mask_helper(masking_utils, "create_sliding_window_causal_mask")
 
         current = generic.check_model_inputs
         if getattr(current, _PATCHED_FLAG, False):
