@@ -25,6 +25,9 @@ from sglang_omni.models.qwen3_omni.components.thinker_model import (
 from sglang_omni.models.qwen3_tts.compat import (
     apply_qwen_tts_transformers_compatibility_patches,
 )
+from sglang_omni.models.qwen3_tts.predictor_kernels import (
+    gather_codec_embedding_and_add,
+)
 from sglang_omni.models.qwen3_tts.sampling_kernels import (
     sample_from_sorted_logprobs_with_seed_small_k,
 )
@@ -86,7 +89,7 @@ class _PredictorDecodeGraph:
         self.model = model
         self.batch_size = batch_size
         self.signature = signature
-        device = model._predictor_input_buffer.device
+        device = model._predictor_k_cache.device
         self.layer0_codes = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         self.talker_hidden = torch.zeros(
             batch_size, 1, hidden_size, dtype=hidden_dtype, device=device
@@ -435,20 +438,12 @@ class Qwen3TTSTalker(nn.Module):
         server_args = get_global_server_args()
         max_batch_size = server_args.max_running_requests
         hidden_size = config.hidden_size
-        predictor_hidden_size = config.code_predictor_config.hidden_size
         predictor_len = config.num_code_groups + 1
         device = self.model.codec_embedding.weight.device
         dtype = self.model.codec_embedding.weight.dtype
         self._feedback_buffer = self.model._feedback_buffer
         self._feedback_mask = self.model._feedback_mask
         self._decode_feedback_embedding = self.model._decode_feedback_embedding
-        self._predictor_input_buffer = torch.zeros(
-            max_batch_size,
-            predictor_len,
-            predictor_hidden_size,
-            device=device,
-            dtype=dtype,
-        )
         cp_layers = self.code_predictor.model.layers
         cp_attn = cp_layers[0].self_attn
         self._predictor_positions = torch.arange(
@@ -479,6 +474,9 @@ class Qwen3TTSTalker(nn.Module):
             device=device,
         )
         self._output_embeds = torch.zeros(
+            max_batch_size, hidden_size, device=device, dtype=dtype
+        )
+        self._predictor_embedding_buffer = torch.empty(
             max_batch_size, hidden_size, device=device, dtype=dtype
         )
         self._sub_batch_size = 0
@@ -1351,39 +1349,46 @@ class Qwen3TTSTalker(nn.Module):
             seq_len=seq_len,
             device=layer0_codes.device,
         )
-        predictor_input = self._predictor_input_buffer[:batch_size]
-        predictor_input.zero_()
+        predictor_dtype = self._predictor_k_cache.dtype
         num_groups = self.config.num_code_groups
         result_codes = self._output_codes[:batch_size].unsqueeze(-1)
         summed_embeddings = self._output_embeds[:batch_size].unsqueeze(1)
         result_codes.zero_()
         summed_embeddings.zero_()
+        embedding_buffer = getattr(self, "_predictor_embedding_buffer", None)
+        if embedding_buffer is not None:
+            embedding_buffer = embedding_buffer[:batch_size]
+        # Capture P2 into a graph; standalone Triton launch loses to ATen.
+        use_fused_embedding = (
+            embedding_buffer is not None
+            and layer0_codes.is_cuda
+            and torch.cuda.is_current_stream_capturing()
+        )
 
         for pos in range(seq_len):
             layer0_code = layer0_codes[:, pos : pos + 1]
             layer0_embed = self.get_input_embeddings()(layer0_code).to(
-                dtype=predictor_input.dtype
+                dtype=predictor_dtype
             )
             layer0_predictor_embed = self.code_predictor.project_input(layer0_embed)
             pos_codes = result_codes[:, :, pos]
             pos_summed = summed_embeddings[:, pos, :]
             pos_summed.zero_()
-            predictor_input[:, 0, :] = self.code_predictor.project_input(
+            talker_predictor_embed = self.code_predictor.project_input(
                 talker_hidden[:, pos : pos + 1, :]
-            )[:, 0, :].to(dtype=predictor_input.dtype)
-            predictor_input[:, 1, :] = layer0_predictor_embed[:, 0, :]
+            ).to(dtype=predictor_dtype)
             pos_codes[:, 0].copy_(layer0_code[:, 0])
             pos_summed.add_(layer0_embed[:, 0, :])
 
             cache_len = 0
             self._predictor_forward_one_token(
-                token_embeds=predictor_input[:, 0:1, :],
+                token_embeds=talker_predictor_embed,
                 batch_size=batch_size,
                 cache_len=cache_len,
             )
             cache_len += 1
             last_hidden = self._predictor_forward_one_token(
-                token_embeds=predictor_input[:, 1:2, :],
+                token_embeds=layer0_predictor_embed,
                 batch_size=batch_size,
                 cache_len=cache_len,
             )
@@ -1397,12 +1402,25 @@ class Qwen3TTSTalker(nn.Module):
                     semantic_positions=semantic_positions[:, pos],
                 )
                 pos_codes[:, layer_idx + 1].copy_(next_code)
-                new_embed = self.code_predictor.model.codec_embedding[layer_idx](
-                    next_code.unsqueeze(1)
-                ).to(dtype=predictor_input.dtype)
+                codec_embedding = self.code_predictor.model.codec_embedding[layer_idx]
+                fused_embedding = (
+                    use_fused_embedding
+                    and embedding_buffer.dtype == predictor_dtype
+                    and gather_codec_embedding_and_add(
+                        next_code,
+                        codec_embedding.weight,
+                        embedding_buffer,
+                        pos_summed,
+                    )
+                )
+                if fused_embedding:
+                    new_embed = embedding_buffer.unsqueeze(1)
+                else:
+                    new_embed = codec_embedding(next_code.unsqueeze(1)).to(
+                        dtype=predictor_dtype
+                    )
+                    pos_summed.add_(new_embed[:, 0, :])
                 new_predictor_embed = self.code_predictor.project_input(new_embed)
-                predictor_input[:, layer_idx + 2, :] = new_predictor_embed[:, 0, :]
-                pos_summed.add_(new_embed[:, 0, :])
                 if layer_idx < num_groups - 2:
                     last_hidden = self._predictor_forward_one_token(
                         token_embeds=new_predictor_embed,
