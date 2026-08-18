@@ -29,6 +29,7 @@ from sglang_omni.models.qwen3_tts.predictor_kernels import (
     gather_codec_embedding_and_add,
 )
 from sglang_omni.models.qwen3_tts.sampling_kernels import (
+    sample_from_logits_with_seed_top_k_top_p,
     sample_from_sorted_logprobs_with_seed_small_k,
 )
 from sglang_omni.vendor.sglang.core import ForwardBatch
@@ -1488,16 +1489,41 @@ class Qwen3TTSTalker(nn.Module):
         semantic_positions: torch.Tensor,
     ) -> torch.Tensor:
         row_indices = row_indices.to(device=logits.device, dtype=torch.long)
-        scores = logits.float()
         temperatures = self._sub_temperature_tensor.index_select(
             0, row_indices
         ).clamp_min(1e-5)
-        scores = scores / temperatures.unsqueeze(1)
 
         vocab_size = int(logits.shape[-1])
         top_ks = self._sub_top_k_tensor.index_select(0, row_indices)
         max_top_k = int(self._sub_sampled_max_top_k)
         has_unbounded_top_k = bool(self._sub_sampled_has_unbounded_top_k)
+        top_ps = self._sub_top_p_tensor.index_select(0, row_indices)
+        seeds = self._sub_sampling_seed_tensor.index_select(0, row_indices)
+        sub_positions = (
+            semantic_positions.to(device=logits.device, dtype=torch.long)
+            * max(int(self.config.num_code_groups) - 1, 1)
+            + int(layer_idx)
+            + 1
+        )
+
+        # The raw-logit fusion has a favorable launch-count tradeoff only in
+        # the predictor CUDA graph. The eager path keeps the mature ATen
+        # sequence, including all of its shape coverage.
+        if logits.is_cuda and torch.cuda.is_current_stream_capturing():
+            fused_sampled = sample_from_logits_with_seed_top_k_top_p(
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                seeds,
+                sub_positions,
+                max_top_k=max_top_k,
+                has_top_p=bool(self._sub_sampled_has_top_p),
+            )
+            if fused_sampled is not None:
+                return fused_sampled.to(torch.long)
+
+        scores = logits.float() / temperatures.unsqueeze(1)
         if max_top_k > 0 and max_top_k < vocab_size and not has_unbounded_top_k:
             sorted_scores, sorted_idx = torch.topk(scores, max_top_k, dim=-1)
             rank = torch.arange(max_top_k, device=logits.device).unsqueeze(0)
@@ -1509,15 +1535,6 @@ class Qwen3TTSTalker(nn.Module):
             keep_all = (top_ks <= 0) | (top_ks >= vocab_size)
             keep_top_k = keep_all.unsqueeze(1) | (rank < top_ks.unsqueeze(1))
             sorted_scores = sorted_scores.masked_fill(~keep_top_k, -float("inf"))
-
-        top_ps = self._sub_top_p_tensor.index_select(0, row_indices)
-        seeds = self._sub_sampling_seed_tensor.index_select(0, row_indices)
-        sub_positions = (
-            semantic_positions.to(device=logits.device, dtype=torch.long)
-            * max(int(self.config.num_code_groups) - 1, 1)
-            + int(layer_idx)
-            + 1
-        )
 
         sorted_probs = torch.softmax(sorted_scores, dim=-1)
         if self._sub_sampled_has_top_p:
