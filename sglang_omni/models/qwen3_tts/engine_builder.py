@@ -17,8 +17,18 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
     context_length = 8192
     model_arch_override = "Qwen3TTSTalker"
 
-    def __init__(self, *, attn_implementation: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        attn_implementation: str | None = None,
+        enable_async_decode: bool = False,
+        async_decode_min_batch_size: int = 2,
+    ) -> None:
+        if async_decode_min_batch_size < 1:
+            raise ValueError("async_decode_min_batch_size must be >= 1")
         self.attn_implementation = attn_implementation
+        self.enable_async_decode = enable_async_decode
+        self.async_decode_min_batch_size = async_decode_min_batch_size
         self.wrapper: Any | None = None
         self._stream_output_builder: Any | None = None
 
@@ -129,6 +139,8 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
             "stream_output_builder": self._stream_output_builder,
             "request_build_max_workers": 4,
             "request_build_max_pending": 16,
+            "enable_async_decode": self.enable_async_decode,
+            "async_decode_min_batch_size": self.async_decode_min_batch_size,
         }
 
     def make_abort_callback(self) -> Any | None:

@@ -382,3 +382,62 @@ def test_finalize_default_batch_generation_hook_calls_single_hook() -> None:
     )
 
     assert calls == [("req-1", 1), ("req-2", 5)]
+
+
+def test_prepare_and_forward_orders_staged_copy_before_decode_forward() -> None:
+    runner = object.__new__(ModelRunner)
+    calls = []
+    result = SimpleNamespace(next_token_ids=torch.tensor([1]))
+    runner._wait_for_staged_token_ids_before_reuse = lambda: calls.append("wait")
+    runner.before_decode = lambda *args, **kwargs: calls.append("before_decode")
+    runner.custom_decode_forward = lambda *args, **kwargs: (
+        calls.append("forward") or result
+    )
+
+    returned = runner._prepare_and_forward(
+        SimpleNamespace(),
+        SimpleNamespace(is_prefill_only=True),
+        [],
+        is_prefill=False,
+    )
+
+    assert returned is result
+    assert calls == ["wait", "before_decode", "forward"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_stage_token_ids_uses_pinned_buffer_and_dedicated_copy_stream() -> None:
+    """The reporting DtoH transfer must not enqueue on the decode stream."""
+
+    runner = object.__new__(ModelRunner)
+    runner._token_id_host_bufs = None
+    runner._token_id_host_slot = 0
+    runner._token_id_copy_stream = None
+    runner._token_id_copy_reuse_event = None
+    runner.device = torch.device("cuda")
+    result = SimpleNamespace()
+    ids = torch.tensor([7, 42], device="cuda", dtype=torch.long)
+    decode_stream = torch.cuda.current_stream()
+
+    runner._stage_token_ids(result, ids)
+
+    assert result._host_token_ids.is_pinned()
+    assert runner._token_id_copy_stream is not None
+    assert runner._token_id_copy_stream.cuda_stream != decode_stream.cuda_stream
+    assert result._host_token_ids_event is not None
+    assert runner._token_id_copy_reuse_event is result._host_token_ids_event
+
+    # A repeated call from _ensure_next_token_ids must retain the first copy,
+    # rather than rotating the ping-pong buffer for the same logical result.
+    first_buffer = result._host_token_ids
+    runner._stage_token_ids(result, ids)
+    assert result._host_token_ids is first_buffer
+
+    # The next decode must only reuse a graph-owned sampler output after the
+    # copy stream finishes reading it. This adds a GPU-side dependency only.
+    runner._wait_for_staged_token_ids_before_reuse()
+    assert runner._token_id_copy_reuse_event is None
+
+    resolved = runner._resolve_host_token_ids(result)
+    assert torch.equal(resolved, torch.tensor([7, 42], dtype=torch.long))
+    assert result._host_token_ids_event is None

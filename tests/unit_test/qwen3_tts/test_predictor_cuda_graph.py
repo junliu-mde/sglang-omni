@@ -86,6 +86,14 @@ def _build_talker(device: torch.device) -> Qwen3TTSTalker:
         1, MAX_BS, NUM_KV_HEADS, predictor_len, HEAD_DIM, device=device, dtype=DTYPE
     )
     talker._predictor_v_cache = torch.zeros_like(talker._predictor_k_cache)
+    talker._predictor_first_token_attention_buffer = torch.empty(
+        MAX_BS,
+        NUM_HEADS,
+        1,
+        HEAD_DIM,
+        device=device,
+        dtype=DTYPE,
+    )
     talker._output_codes = torch.zeros(
         MAX_BS, NUM_CODE_GROUPS, dtype=torch.long, device=device
     )
@@ -168,6 +176,9 @@ def _build_talker(device: torch.device) -> Qwen3TTSTalker:
     talker._predictor_graph_enabled = True
     talker._predictor_graph_failure_count = 0
     talker._predictor_graph_pool = None
+    talker._predictor_fused_kv_cache_enabled = True
+    talker._predictor_fused_first_token_attention_enabled = True
+    talker._predictor_fused_attention_enabled = True
     return talker
 
 
@@ -423,6 +434,18 @@ def test_env_switch_parsing(monkeypatch: pytest.MonkeyPatch):
     assert sglang_model_module._predictor_graph_env_enabled() is True
 
 
+def test_first_token_attention_env_switch_parsing(monkeypatch: pytest.MonkeyPatch):
+    env = sglang_model_module.QTTS_PREDICTOR_FUSED_FIRST_TOKEN_ATTENTION_ENV
+    monkeypatch.delenv(env, raising=False)
+    assert sglang_model_module._predictor_fused_first_token_attention_env_enabled()
+    monkeypatch.setenv(env, "0")
+    assert not sglang_model_module._predictor_fused_first_token_attention_env_enabled()
+    monkeypatch.setenv(env, "false")
+    assert not sglang_model_module._predictor_fused_first_token_attention_env_enabled()
+    monkeypatch.setenv(env, "1")
+    assert sglang_model_module._predictor_fused_first_token_attention_env_enabled()
+
+
 @pytest.mark.skipif(not _HAS_CUDA, reason="predictor CUDA graph needs CUDA")
 def test_capture_failure_disables_key_and_falls_back(
     monkeypatch: pytest.MonkeyPatch,
@@ -636,9 +659,9 @@ def test_row_top_k_below_bucket_width_bit_identity():
     eager_codes, eager_embeds = _run_eager(talker, layer0, hidden, positions)
     graph_codes, graph_embeds = _run_forward(talker, layer0, hidden, positions)
 
-    assert any(
-        key[2] == 8 for key in talker._predictor_graphs
-    ), f"expected capture at ladder width 8, got keys {sorted(talker._predictor_graphs)}"
+    assert any(key[2] == 8 for key in talker._predictor_graphs), (
+        f"expected capture at ladder width 8, got keys {sorted(talker._predictor_graphs)}"
+    )
     assert torch.equal(graph_codes, eager_codes)
     assert torch.equal(graph_embeds, eager_embeds)
 
@@ -805,9 +828,9 @@ def test_top_p_removed_ranks_never_sampled():
             row_indices=row_indices,
             semantic_positions=positions,
         )
-        assert (
-            token.item() == 3
-        ), f"seed={seed} sampled a nucleus-removed rank: {token.item()}"
+        assert token.item() == 3, (
+            f"seed={seed} sampled a nucleus-removed rank: {token.item()}"
+        )
 
 
 def test_capture_state_pre_yield_failure_restores_state():

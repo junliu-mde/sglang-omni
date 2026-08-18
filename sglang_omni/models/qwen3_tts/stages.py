@@ -146,11 +146,15 @@ def create_sglang_tts_engine_executor(
     dtype: str = "bfloat16",
     attn_implementation: str | None = None,
     server_args_overrides: dict[str, Any] | None = None,
+    enable_async_decode: bool = False,
+    async_decode_min_batch_size: int = 2,
 ) -> Any:
     from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
 
     return Qwen3TtsEngineBuilder(
         attn_implementation=attn_implementation,
+        enable_async_decode=enable_async_decode,
+        async_decode_min_batch_size=async_decode_min_batch_size,
     ).build(
         model_path,
         device=device,

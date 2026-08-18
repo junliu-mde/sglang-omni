@@ -90,18 +90,20 @@ def test_decode_mode_cli_invalid_mode_rejected():
         )
 
 
-def test_decode_mode_cli_rejects_unsupported_config():
+def test_decode_mode_cli_applies_to_qwen3_tts_stage():
     config = Qwen3TTSPipelineConfig(model_path="dummy")
-    with pytest.raises(
-        typer.BadParameter,
-        match=(
-            "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, "
-            "Qwen3-ASR, ARK-ASR, Whisper ASR, and the Qwen3-Omni thinker"
-        ),
-    ):
-        apply_decode_mode_cli_overrides(
-            config, decode_mode="sync", async_lookahead_min_batch_size=None
-        )
+    apply_decode_mode_cli_overrides(
+        config, decode_mode="async", async_lookahead_min_batch_size=4
+    )
+
+    args = _tts_engine_args(config)
+    assert args["enable_async_decode"] is True
+    assert args["async_decode_min_batch_size"] == 4
+
+    apply_decode_mode_cli_overrides(
+        config, decode_mode="sync", async_lookahead_min_batch_size=None
+    )
+    assert _tts_engine_args(config)["enable_async_decode"] is False
 
 
 def test_decode_mode_help_lists_whisper_asr():

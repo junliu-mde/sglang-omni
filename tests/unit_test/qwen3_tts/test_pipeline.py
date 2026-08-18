@@ -194,20 +194,20 @@ def install_fake_sglang(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
     modules["sgl_kernel"].fused_qk_norm_rope = lambda *args, **kwargs: None
     modules["sglang.srt.managers.schedule_batch"].Req = FakeReq
-    modules["sglang.srt.managers.scheduler"].GenerationBatchResult = (
-        FakeGenerationBatchResult
-    )
-    modules["sglang.srt.layers.logits_processor"].LogitsProcessorOutput = (
-        FakeLogitsProcessorOutput
-    )
+    modules[
+        "sglang.srt.managers.scheduler"
+    ].GenerationBatchResult = FakeGenerationBatchResult
+    modules[
+        "sglang.srt.layers.logits_processor"
+    ].LogitsProcessorOutput = FakeLogitsProcessorOutput
     modules["sglang.srt.layers.sampler"].multinomial_with_seed = multinomial_with_seed
     modules["sglang.srt.layers.sampler"].sampler_calls = sampler_calls
-    modules["sglang.srt.model_loader.weight_utils"].default_weight_loader = (
-        default_weight_loader
-    )
-    modules["sglang.srt.sampling.sampling_batch_info"].SamplingBatchInfo = (
-        FakeSamplingBatchInfo
-    )
+    modules[
+        "sglang.srt.model_loader.weight_utils"
+    ].default_weight_loader = default_weight_loader
+    modules[
+        "sglang.srt.sampling.sampling_batch_info"
+    ].SamplingBatchInfo = FakeSamplingBatchInfo
     modules["sglang.srt.sampling.sampling_params"].SamplingParams = FakeSamplingParams
     modules["sglang.srt.utils"].add_prefix = add_prefix
     for name, module in modules.items():
@@ -2498,6 +2498,7 @@ def test_qwen3_tts_request_data_keeps_decode_tensors_on_prepared_device(
     assert data.req.sampling_params.sampling_seed == data.semantic_sampling_seed
     assert isinstance(data.subtalker_sampling_seed, int)
     assert 0 <= data.subtalker_sampling_seed <= 0x7FFFFFFF
+    assert data.req.sampling_params.repetition_penalty == 1.05
 
 
 def test_qwen3_tts_request_data_uses_private_sampling_seeds(
@@ -2985,7 +2986,6 @@ def test_qwen3_tts_collect_codes_excludes_semantic_eos(
     from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
 
     runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
-    runner._has_pending_code_step = False
 
     def code_predictor_forward(layer0_codes, hidden, semantic_positions=None):
         assert layer0_codes.tolist() == [[7], [42]]
@@ -3036,6 +3036,101 @@ def test_qwen3_tts_collect_codes_excludes_semantic_eos(
     assert len(requests[0].data.output_codes) == 1
 
 
+def test_qwen3_tts_async_decode_snapshots_predictor_outputs_before_resolve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lookahead must retain its frame while the next launch reuses model buffers."""
+
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
+
+    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    runner.model = SimpleNamespace(
+        config=SimpleNamespace(codec_eos_token_id=42),
+        _output_codes=torch.tensor([[1, 2], [3, 4]], dtype=torch.long),
+        _output_embeds=torch.tensor([[0.1, 0.2], [0.3, 0.4]]),
+    )
+    result = SimpleNamespace(
+        next_token_ids=torch.tensor([7, 42], dtype=torch.long),
+        logits_output=SimpleNamespace(hidden_states=torch.ones((2, 4))),
+    )
+    runner._collect_codes = (
+        lambda result, forward_batch, schedule_batch, requests: setattr(
+            result, "_qwen3_tts_has_code_step", True
+        )
+    )
+    forward_batch = SimpleNamespace()
+    requests = [
+        SimpleNamespace(request_id="active", data=Qwen3TTSSGLangRequestData()),
+        SimpleNamespace(request_id="eos", data=Qwen3TTSSGLangRequestData()),
+    ]
+
+    launch = runner.post_decode_launch(result, forward_batch, requests)
+
+    assert launch is not None
+    assert len(requests[0].data.pending_feedback_queue) == 1
+    assert len(requests[1].data.pending_feedback_queue) == 1
+
+    runner.model._output_codes.fill_(99)
+    runner.model._output_embeds.fill_(9)
+    runner.post_decode_resolve(launch, result, forward_batch, object(), requests)
+    runner.post_process_outputs(
+        result,
+        SimpleNamespace(requests=requests),
+        {
+            "active": RequestOutput("active", data=7),
+            "eos": RequestOutput("eos", data=42),
+        },
+    )
+
+    assert [chunk.tolist() for chunk in requests[0].data.output_codes] == [[1, 2]]
+    assert torch.equal(
+        requests[0].data.pending_feedback_queue[0], torch.tensor([0.1, 0.2])
+    )
+    assert requests[1].data.output_codes == []
+    assert not requests[1].data.pending_feedback_queue
+
+
+@pytest.mark.parametrize(
+    ("repetition_penalty", "request_data", "expected"),
+    [
+        (1.0, SimpleNamespace(return_logprob=False), True),
+        (1.05, SimpleNamespace(return_logprob=False), False),
+        (1.0, SimpleNamespace(return_logprob=True), False),
+        (1.0, SimpleNamespace(), False),
+        (1.0, None, False),
+    ],
+)
+def test_qwen3_tts_lookahead_requires_history_free_sampling(
+    monkeypatch: pytest.MonkeyPatch,
+    repetition_penalty: float,
+    request_data: SimpleNamespace | None,
+    expected: bool,
+) -> None:
+    """Only raw SGLang requests with safe Omni data may use lookahead."""
+
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
+
+    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    sampling_params = SimpleNamespace(
+        repetition_penalty=repetition_penalty,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        min_new_tokens=0,
+    )
+    batch = SimpleNamespace(
+        reqs=[
+            SimpleNamespace(
+                sampling_params=sampling_params,
+                _omni_data=request_data,
+            )
+        ]
+    )
+
+    assert runner.lookahead_eligible(batch) is expected
+
+
 def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3055,7 +3150,11 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
         forward_batch_info.ForwardBatch,
         "init_new",
         staticmethod(
-            lambda model_worker_batch, model_runner, *, capture_hidden_mode=None, return_hidden_states_before_norm: fake_forward_batch
+            lambda model_worker_batch,
+            model_runner,
+            *,
+            capture_hidden_mode=None,
+            return_hidden_states_before_norm: fake_forward_batch
         ),
     )
     monkeypatch.setattr(
@@ -3276,6 +3375,32 @@ def test_qwen3_tts_prepare_decode_buffers_collects_private_subtalker_seeds(
     # top_k=40 ladder-quantizes to 50 (shared predictor-graph key width).
     assert talker._sub_sampled_max_top_k == 50
     assert talker._sub_sampled_has_unbounded_top_k is False
+
+    # These fields are request constants. A steady decode batch must retain the
+    # device buffers instead of recreating small host tensors and H2D copies.
+    for tensor in (
+        talker._semantic_sampling_seed_tensor,
+        talker._sub_sampling_seed_tensor,
+        talker._sub_temperature_tensor,
+        talker._sub_top_p_tensor,
+        talker._sub_top_k_tensor,
+        talker._sub_sample_row_indices_tensor,
+    ):
+        tensor.fill_(-1)
+    Qwen3TTSTalker.prepare_decode_buffers(talker, requests)
+    assert torch.equal(
+        talker._semantic_sampling_seed_tensor[:2], torch.tensor([-1, -1])
+    )
+    assert torch.equal(talker._sub_top_k_tensor[:2], torch.tensor([-1, -1]))
+
+    # A changed request value invalidates the cache and restores all device
+    # controls before the next Predictor launch.
+    requests[0].data.subtalker_top_k = 60
+    Qwen3TTSTalker.prepare_decode_buffers(talker, requests)
+    assert talker._semantic_sampling_seed_tensor[:2].tolist() == [5, 9]
+    assert talker._sub_sampling_seed_tensor[:2].tolist() == [7, 11]
+    assert talker._sub_top_k_tensor[:2].tolist() == [60, -1]
+    assert talker._sub_sampled_max_top_k == 64
 
 
 def test_qwen3_tts_prepare_decode_buffers_requires_owned_request_data(
@@ -3734,6 +3859,8 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_reenables_cuda_graph(
     scheduler = stages.create_sglang_tts_engine_executor(
         "model",
         device=None,
+        enable_async_decode=True,
+        async_decode_min_batch_size=4,
         server_args_overrides={
             "cuda_graph_max_bs": 64,
             "torch_compile_max_bs": 64,
@@ -3789,6 +3916,8 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_reenables_cuda_graph(
     assert scheduler.server_args.disable_cuda_graph is False
     assert scheduler.server_args.enable_torch_compile is False
     assert scheduler.server_args.torch_compile_max_bs == 64
+    assert scheduler.enable_async_decode is True
+    assert scheduler.async_decode_min_batch_size == 4
     clear_qwen3_tts_preprocessing_context()
 
 
@@ -3915,6 +4044,31 @@ def test_qwen3_tts_engine_probes_runtime_before_checkpoint_resolution(
 def test_qwen3_tts_mem_fraction_role_to_stage_targets_tts_engine() -> None:
     assert Qwen3TTSPipelineConfig.mem_fraction_role_to_stage() == {
         "talker": "tts_engine"
+    }
+
+
+def test_qwen3_tts_talker_sglang_role_to_stage_targets_tts_engine() -> None:
+    assert Qwen3TTSPipelineConfig.talker_sglang_role_to_stage() == {
+        "talker": "tts_engine"
+    }
+
+
+def test_qwen3_tts_cli_can_disable_talker_torch_compile() -> None:
+    from sglang_omni.cli.serve import apply_torch_compile_cli_overrides
+
+    config = Qwen3TTSPipelineConfig(model_path="fake-model")
+    apply_torch_compile_cli_overrides(
+        config,
+        thinker_torch_compile="default",
+        talker_torch_compile="off",
+        thinker_torch_compile_max_bs=None,
+        talker_torch_compile_max_bs=4,
+    )
+
+    tts_engine = next(stage for stage in config.stages if stage.name == "tts_engine")
+    assert tts_engine.factory_args["server_args_overrides"] == {
+        "enable_torch_compile": False,
+        "torch_compile_max_bs": 4,
     }
 
 

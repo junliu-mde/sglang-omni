@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -14,17 +15,67 @@ from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRun
 from sglang_omni.scheduling.types import RequestOutput
 
 
+@dataclass
+class _Qwen3TTSDecodeLaunch:
+    """Device snapshots owned by one asynchronous Qwen3-TTS decode step."""
+
+    code_snapshot: torch.Tensor
+    feedback_snapshot: torch.Tensor
+    feedback_rows: tuple[torch.Tensor, ...]
+
+
 class Qwen3TTSModelRunner(ModelRunner):
     """Runs Qwen3-TTS AR steps and stores generated codec frames per request."""
 
     def __init__(self, tp_worker: Any, output_processor: Any):
         super().__init__(tp_worker, output_processor)
-        self._has_pending_code_step = False
-        self._row_ids_cache: torch.Tensor | None = None
-        self._mask_last_sampled: torch.Tensor | None = None
-        self._mask_prep_rids: list | None = None
-        self._mask_rep_active = False
-        self._mask_sup_active = False
+
+    def _prepare_and_forward(
+        self,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+        is_prefill: bool,
+        *,
+        is_lookahead: bool = False,
+    ) -> Any:
+        """Start the semantic-id DtoH copy before Predictor GPU work.
+
+        Qwen3-TTS samples the semantic id before its Predictor pass. Staging it
+        here lets the dedicated copy stream transfer the id while the Predictor
+        computes codec ids and feedback on the decode stream.
+        """
+
+        result = super()._prepare_and_forward(
+            forward_batch,
+            schedule_batch,
+            requests,
+            is_prefill,
+            is_lookahead=is_lookahead,
+        )
+        token_ids = result.next_token_ids
+        if isinstance(token_ids, torch.Tensor) and token_ids.is_cuda:
+            self._stage_token_ids(result, token_ids)
+        return result
+
+    def _ensure_next_token_ids(
+        self,
+        batch_result: Any,
+        forward_batch: Any,
+        schedule_batch: Any,
+        scheduler_output: Any,
+    ) -> None:
+        """Cover any future path that materializes ids after the post hook."""
+
+        super()._ensure_next_token_ids(
+            batch_result,
+            forward_batch,
+            schedule_batch,
+            scheduler_output,
+        )
+        token_ids = batch_result.next_token_ids
+        if isinstance(token_ids, torch.Tensor) and token_ids.is_cuda:
+            self._stage_token_ids(batch_result, token_ids)
 
     def before_prefill(
         self,
@@ -78,6 +129,22 @@ class Qwen3TTSModelRunner(ModelRunner):
         requests: list,
     ) -> None:
         self._collect_codes(result, forward_batch, schedule_batch, requests)
+
+    def lookahead_eligible(self, batch: Any) -> bool:
+        """Use lookahead only where the sampled output is history-independent."""
+
+        if not super().lookahead_eligible(batch):
+            return False
+        # ``batch.reqs`` contains SGLang's raw ``Req`` objects. Omni request
+        # data is attached at admission under the private attribute, while the
+        # ``SchedulerRequest.data`` wrapper exists only after launch. A missing
+        # value must stay on the synchronous path because lookahead does not
+        # preserve the normal logprob collection order.
+        for req in batch.reqs:
+            data = getattr(req, "_omni_data", None)
+            if data is None or getattr(data, "return_logprob", True):
+                return False
+        return True
 
     def sample_before_post_prefill(
         self, forward_batch: Any, schedule_batch: Any, requests: list
@@ -270,7 +337,7 @@ class Qwen3TTSModelRunner(ModelRunner):
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        self._has_pending_code_step = False
+        result._qwen3_tts_has_code_step = False
         if result.next_token_ids is None:
             return
         layer0_codes = result.next_token_ids
@@ -286,11 +353,77 @@ class Qwen3TTSModelRunner(ModelRunner):
             hidden,
             semantic_positions=semantic_positions,
         )
-        # Note: (Jiaxin Deng) stage the ids into pinned host memory now so the
-        # output processor's .tolist() waits on an event instead of issuing a
-        # blocking pageable copy inside the decode loop.
-        self._stage_token_ids(result, result.next_token_ids)
-        self._has_pending_code_step = True
+        result._qwen3_tts_has_code_step = True
+
+    def post_decode_launch(
+        self,
+        result: Any,
+        forward_batch: Any,
+        requests: list,
+    ) -> _Qwen3TTSDecodeLaunch | None:
+        """Run Predictor before resolve and publish its feedback for lookahead.
+
+        The next decode launch consumes this step's Predictor feedback before
+        the scheduler resolves the semantic id on the host. The Predictor owns
+        reusable output buffers, so retain private device snapshots for the
+        later resolve/output phase.
+        """
+
+        if not requests:
+            return None
+        if result.next_token_ids is None:
+            result.next_token_ids = self._sample_next_token_ids(
+                result.logits_output,
+                forward_batch,
+                None,
+                requests,
+            )
+        token_ids = result.next_token_ids
+        if isinstance(token_ids, torch.Tensor) and token_ids.is_cuda:
+            self._stage_token_ids(result, token_ids)
+        self._collect_codes(result, forward_batch, None, requests)
+        if not getattr(result, "_qwen3_tts_has_code_step", False):
+            return None
+
+        batch_size = len(requests)
+        code_snapshot = self.model._output_codes[:batch_size].detach().clone()
+        feedback_snapshot = self.model._output_embeds[:batch_size].detach().clone()
+        # Keep the exact row views that enter the request queues. A new view of
+        # the same tensor would not compare by identity when an EOS row must be
+        # removed during resolve.
+        feedback_rows = tuple(
+            feedback_snapshot[row_idx] for row_idx in range(batch_size)
+        )
+        for row_idx, sched_req in enumerate(requests):
+            sched_req.data.pending_feedback_queue.append(feedback_rows[row_idx])
+
+        result._qwen3_tts_code_snapshot = code_snapshot
+        result._qwen3_tts_feedback_snapshot = feedback_snapshot
+        result._qwen3_tts_feedback_rows = feedback_rows
+        result._qwen3_tts_feedback_prepublished = True
+        return _Qwen3TTSDecodeLaunch(
+            code_snapshot=code_snapshot,
+            feedback_snapshot=feedback_snapshot,
+            feedback_rows=feedback_rows,
+        )
+
+    def post_decode_resolve(
+        self,
+        launch_buf: _Qwen3TTSDecodeLaunch | None,
+        result: Any,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+    ) -> None:
+        """Restore launch-owned snapshots after the lookahead completion event."""
+
+        del forward_batch, schedule_batch, requests
+        if launch_buf is None:
+            return
+        result._qwen3_tts_code_snapshot = launch_buf.code_snapshot
+        result._qwen3_tts_feedback_snapshot = launch_buf.feedback_snapshot
+        result._qwen3_tts_feedback_rows = launch_buf.feedback_rows
+        result._qwen3_tts_feedback_prepublished = True
 
     def post_process_outputs(
         self,
@@ -298,10 +431,21 @@ class Qwen3TTSModelRunner(ModelRunner):
         scheduler_output: Any,
         outputs: dict[str, RequestOutput],
     ) -> None:
-        del result
-        if not self._has_pending_code_step:
+        if not getattr(result, "_qwen3_tts_has_code_step", False):
             return
-        self._has_pending_code_step = False
+        result._qwen3_tts_has_code_step = False
+
+        code_snapshot = getattr(result, "_qwen3_tts_code_snapshot", None)
+        feedback_snapshot = getattr(result, "_qwen3_tts_feedback_snapshot", None)
+        feedback_rows = getattr(result, "_qwen3_tts_feedback_rows", None)
+        feedback_prepublished = bool(
+            getattr(result, "_qwen3_tts_feedback_prepublished", False)
+        )
+        has_async_snapshot = code_snapshot is not None and feedback_rows is not None
+        if code_snapshot is None:
+            code_snapshot = self.model._output_codes
+        if feedback_snapshot is None:
+            feedback_snapshot = self.model._output_embeds
         eos_id = int(self.model.config.codec_eos_token_id)
         # Note: (Jiaxin Deng) per-row clones were a c32 decode-loop hot spot;
         # rows must stay views of a snapshot, never of the reused graph buffers.
@@ -310,12 +454,35 @@ class Qwen3TTSModelRunner(ModelRunner):
         embeds_snap = self.model._output_embeds[:batch_size].detach().clone()
         for row_idx, sched_req in enumerate(scheduler_output.requests):
             req_output = outputs[sched_req.request_id]
-            if req_output.data is None or int(req_output.data) == eos_id:
+            code_chunk = code_snapshot[row_idx]
+            feedback = (
+                feedback_rows[row_idx]
+                if feedback_rows is not None
+                else feedback_snapshot[row_idx]
+            )
+            is_terminal = req_output.data is None or int(req_output.data) == eos_id
+            if is_terminal:
+                if feedback_prepublished:
+                    self._discard_prepublished_feedback(sched_req.data, feedback)
                 continue
-            code_chunk = codes_snap[row_idx]
+            if not has_async_snapshot:
+                code_chunk = code_chunk.detach().clone()
+                feedback = feedback.detach().clone()
             sched_req.data.output_codes.append(code_chunk)
-            sched_req.data.latest_stream_code_chunk = code_chunk
-            sched_req.data.pending_feedback_queue.append(embeds_snap[row_idx])
+            if not feedback_prepublished:
+                sched_req.data.pending_feedback_queue.append(feedback)
+
+    @staticmethod
+    def _discard_prepublished_feedback(data: Any, feedback: torch.Tensor) -> None:
+        """Remove a feedback row that was published for an EOS semantic id."""
+
+        queue = getattr(data, "pending_feedback_queue", None)
+        if queue is None:
+            return
+        for index, queued_feedback in enumerate(queue):
+            if queued_feedback is feedback:
+                del queue[index]
+                return
 
     def _sample_positions(
         self, forward_batch: Any, device: torch.device

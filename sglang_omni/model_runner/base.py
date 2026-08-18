@@ -117,21 +117,79 @@ class ModelRunner:
         self._token_id_host_bufs: list[torch.Tensor] | None = None
         self._token_id_host_slot: int = 0
         self._suppress_tensor_cache: dict[tuple, tuple[Any, torch.Tensor | None]] = {}
+        # Reporting tokens are tiny, but pageable DtoH copies make ``tolist``
+        # synchronize the decode stream. Keep a dedicated copy stream so a
+        # model-specific post-decode GPU path can run while the ids transfer.
+        self._token_id_copy_stream: torch.cuda.Stream | None = None
+        # A graph-backed sampler can reuse its output storage on the next
+        # decode. The next forward waits on this event before it can overwrite
+        # a buffer that the copy stream still reads.
+        self._token_id_copy_reuse_event: torch.cuda.Event | None = None
+
+    def _wait_for_staged_token_ids_before_reuse(self) -> None:
+        """Order the next decode after an outstanding reporting-token DtoH copy.
+
+        This is a stream wait, not a host wait. It preserves overlap with the
+        current step's Predictor and prevents a reusable CUDA Graph output from
+        racing its dedicated-copy-stream read on the next forward.
+        """
+
+        event = getattr(self, "_token_id_copy_reuse_event", None)
+        if event is None:
+            return
+        device = self.device
+        if device.type != "cuda":
+            self._token_id_copy_reuse_event = None
+            return
+        with torch.cuda.device(device):
+            # A staged copy is intentionally not part of a CUDA Graph. Do not
+            # connect a non-captured event to an active capture.
+            if torch.cuda.is_current_stream_capturing():
+                return
+            torch.cuda.current_stream(device=device).wait_event(event)
+        self._token_id_copy_reuse_event = None
 
     def _stage_token_ids(self, result: Any, ids: torch.Tensor) -> None:
-        # Note (wenyao): pinned host copy staged once at sample time so downstream
-        # .tolist() never triggers a blocking pageable D2H; next_token_ids stays device-side
+        """Stage reporting tokens in pinned host memory without blocking decode.
+
+        The producer event orders the copy stream after sampling. The decode
+        stream can then continue with model-specific GPU work. ``_finalize``
+        waits only for the copy-complete event before the host reads the buffer.
+        """
+
+        if getattr(result, "_host_token_ids_source", None) is ids:
+            return
         if not (isinstance(ids, torch.Tensor) and ids.is_cuda):
             result._host_token_ids = ids
             result._host_token_ids_event = None
+            result._host_token_ids_producer_event = None
+            result._host_token_ids_source = ids
+            return
+        # CUDA graph capture only permits dependencies wholly inside the graph.
+        # The reporting copy is outside the graph, so leave this result on the
+        # normal path instead of creating an invalid cross-stream dependency.
+        if torch.cuda.is_current_stream_capturing():
             return
         n = ids.shape[0]
         buf = self._next_token_id_host_buf(ids, n)
-        buf[:n].copy_(ids[:n], non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
+        with torch.cuda.device(ids.device):
+            copy_stream = getattr(self, "_token_id_copy_stream", None)
+            if copy_stream is None:
+                copy_stream = torch.cuda.Stream(device=ids.device)
+                self._token_id_copy_stream = copy_stream
+            producer_event = torch.cuda.Event(enable_timing=False)
+            copy_complete_event = torch.cuda.Event(enable_timing=False)
+            producer_event.record(torch.cuda.current_stream(device=ids.device))
+            with torch.cuda.stream(copy_stream):
+                copy_stream.wait_event(producer_event)
+                buf[:n].copy_(ids[:n], non_blocking=True)
+                copy_complete_event.record(copy_stream)
         result._host_token_ids = buf[:n]
-        result._host_token_ids_event = event
+        result._host_token_ids_event = copy_complete_event
+        # Keep the producer event alive until the copy stream consumes it.
+        result._host_token_ids_producer_event = producer_event
+        result._host_token_ids_source = ids
+        self._token_id_copy_reuse_event = copy_complete_event
 
     def _next_token_id_host_buf(self, like: torch.Tensor, n: int) -> torch.Tensor:
         # Note (wenyao): two buffers ping-ponged so a step's host read never races
@@ -184,6 +242,9 @@ class ModelRunner:
         if event is not None:
             event.synchronize()
             result._host_token_ids_event = None
+            result._host_token_ids_producer_event = None
+            if getattr(self, "_token_id_copy_reuse_event", None) is event:
+                self._token_id_copy_reuse_event = None
         return getattr(result, "_host_token_ids", None)
 
     def bind_execution_bridge(self, bridge: Any) -> None:
@@ -434,6 +495,11 @@ class ModelRunner:
     ):
         """Prepare hook → standard forward (if not custom) → sample-before-post
         block. Returns ``batch_result``."""
+        # A previous reporting-token DtoH copy can still read a CUDA Graph's
+        # reusable sampler output. Order the next forward after that copy on
+        # the GPU. This applies to every runner that uses ``_stage_token_ids``;
+        # keeping it here prevents a model-specific caller from missing it.
+        self._wait_for_staged_token_ids_before_reuse()
         try:
             if is_prefill:
                 self.before_prefill(forward_batch, schedule_batch, requests)

@@ -31,6 +31,7 @@ _ASYNC_DECODE_FACTORIES = frozenset(
     {
         "sglang_omni.models.higgs_tts.stages.create_sglang_tts_engine_executor",
         "sglang_omni.models.moss_tts_local.stages.create_sglang_tts_engine_executor",
+        "sglang_omni.models.qwen3_tts.stages.create_sglang_tts_engine_executor",
         "sglang_omni.models.qwen3_omni.stages."
         "create_sglang_thinker_executor_from_config",
         "sglang_omni.models.moss_transcribe_diarize.stages."
@@ -42,7 +43,7 @@ _ASYNC_DECODE_FACTORIES = frozenset(
     }
 )
 _ASYNC_DECODE_SUPPORTED_MODELS = (
-    "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, "
+    "Higgs TTS, MOSS-TTS-Local, Qwen3-TTS, MOSS-Transcribe-Diarize, Fun-ASR, "
     "Qwen3-ASR, ARK-ASR, Whisper ASR, and the Qwen3-Omni thinker"
 )
 _PREFILL_COALESCE_FACTORIES = frozenset(
@@ -1274,8 +1275,7 @@ def serve(
             "--talker-torch-compile",
             "--talker_torch_compile",
             help=(
-                "torch.compile mode for supported SGLang talker stage: "
-                "default|on|off."
+                "torch.compile mode for supported SGLang talker stage: default|on|off."
             ),
         ),
     ] = "default",
@@ -1335,7 +1335,9 @@ def serve(
                 "default. Async mode enables one-step lookahead, "
                 "which can overlap the previous step's host-side collect with "
                 "the next GPU forward. Available for "
-                f"{_ASYNC_DECODE_SUPPORTED_MODELS}."
+                f"{_ASYNC_DECODE_SUPPORTED_MODELS}. Qwen3-TTS uses lookahead "
+                "only when repetition_penalty is 1.0; its 1.05 default uses "
+                "synchronous decode to preserve sampling semantics."
             ),
         ),
     ] = None,

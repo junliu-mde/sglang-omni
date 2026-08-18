@@ -27,6 +27,8 @@ from sglang_omni.models.qwen3_tts.compat import (
 )
 from sglang_omni.models.qwen3_tts.predictor_kernels import (
     gather_codec_embedding_and_add,
+    store_predictor_kv_and_expand_gqa_first_token,
+    store_predictor_kv_cache,
 )
 from sglang_omni.models.qwen3_tts.sampling_kernels import (
     sample_from_logits_with_seed_top_k_top_p,
@@ -40,6 +42,10 @@ from sglang_omni.vendor.sglang.server_args import get_global_server_args
 logger = logging.getLogger(__name__)
 
 QTTS_PREDICTOR_GRAPH_ENV = "SGLANG_OMNI_QTTS_PREDICTOR_GRAPH"
+QTTS_PREDICTOR_FUSED_KV_CACHE_ENV = "SGLANG_OMNI_QTTS_PREDICTOR_FUSED_KV_CACHE"
+QTTS_PREDICTOR_FUSED_FIRST_TOKEN_ATTENTION_ENV = (
+    "SGLANG_OMNI_QTTS_PREDICTOR_FUSED_FIRST_TOKEN_ATTENTION"
+)
 _PREDICTOR_GRAPH_MAX_KEYS = 32
 _PREDICTOR_GRAPH_MAX_FAILURES = 8
 # Note: (Jiaxin Deng) 50 is on the ladder because it is the family checkpoint
@@ -49,6 +55,20 @@ _PREDICTOR_TOP_K_LADDER = (4, 8, 16, 32, 50, 64, 128, 256, 512, 1024)
 
 def _predictor_graph_env_enabled() -> bool:
     value = os.environ.get(QTTS_PREDICTOR_GRAPH_ENV, "1").strip().lower()
+    return value not in ("0", "false", "off", "no")
+
+
+def _predictor_fused_kv_cache_env_enabled() -> bool:
+    value = os.environ.get(QTTS_PREDICTOR_FUSED_KV_CACHE_ENV, "1").strip().lower()
+    return value not in ("0", "false", "off", "no")
+
+
+def _predictor_fused_first_token_attention_env_enabled() -> bool:
+    value = (
+        os.environ.get(QTTS_PREDICTOR_FUSED_FIRST_TOKEN_ATTENTION_ENV, "1")
+        .strip()
+        .lower()
+    )
     return value not in ("0", "false", "off", "no")
 
 
@@ -124,7 +144,10 @@ class _PredictorDecodeGraph:
             current_stream = torch.cuda.current_stream(device=device)
             warmup_stream = torch.cuda.Stream(device=device)
             warmup_stream.wait_stream(current_stream)
-            with torch.cuda.stream(warmup_stream):
+            with (
+                torch.cuda.stream(warmup_stream),
+                model._predictor_fused_first_token_attention_warmup_state(),
+            ):
                 for _ in range(2):
                     model._code_predictor_forward_incremental(
                         self.layer0_codes,
@@ -465,6 +488,14 @@ class Qwen3TTSTalker(nn.Module):
             dtype=dtype,
         )
         self._predictor_v_cache = torch.zeros_like(self._predictor_k_cache)
+        self._predictor_first_token_attention_buffer = torch.empty(
+            max_batch_size,
+            cp_attn.num_heads,
+            1,
+            cp_attn.head_dim,
+            device=device,
+            dtype=dtype,
+        )
         self._sampled_token_ids = torch.zeros(
             max_batch_size, dtype=torch.long, device=device
         )
@@ -506,6 +537,13 @@ class Qwen3TTSTalker(nn.Module):
         self._sub_sampled_max_top_k = 0
         self._sub_sampled_has_unbounded_top_k = False
         self._decode_prep_rids: list | None = None
+        # The Predictor sampling controls belong to requests, not decode steps.
+        # Keep the device-side buffers untouched while their ordered values are
+        # unchanged. This removes the otherwise repeated tiny H2D copies from
+        # steady-state decode without weakening per-request seed isolation.
+        self._decode_sampling_signature: (
+            tuple[tuple[int, bool, float, float, int, int], ...] | None
+        ) = None
         self._predictor_graph_batch_sizes = self._normalize_predictor_graph_batch_sizes(
             server_args,
             max_batch_size=max_batch_size,
@@ -517,6 +555,14 @@ class Qwen3TTSTalker(nn.Module):
         self._predictor_graph_enabled: bool | None = None
         self._predictor_graph_failure_count = 0
         self._predictor_graph_pool = None
+        # Read once before CUDA Graph capture. The graph retains whichever
+        # implementation is selected at capture time, so changing the process
+        # environment after startup must not silently change replay behavior.
+        self._predictor_fused_kv_cache_enabled = _predictor_fused_kv_cache_env_enabled()
+        self._predictor_fused_first_token_attention_enabled = (
+            _predictor_fused_first_token_attention_env_enabled()
+        )
+        self._predictor_fused_first_token_attention_warmup = False
         _bind_default_weight_loaders(self)
         self._cached_params_dict = dict(self.named_parameters())
         self._sampler = None
@@ -995,12 +1041,8 @@ class Qwen3TTSTalker(nn.Module):
             return
         self._decode_prep_rids = None
 
-        semantic_seeds: list[int] = []
-        sub_temperatures: list[float] = []
-        sub_top_ps: list[float] = []
-        sub_top_ks: list[int] = []
-        sub_seeds: list[int] = []
-        self._sub_sample_rows = []
+        sampling_rows: list[tuple[int, bool, float, float, int, int]] = []
+        sampled_rows: list[int] = []
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
             try:
@@ -1020,13 +1062,30 @@ class Qwen3TTSTalker(nn.Module):
                     "Qwen3-TTS decode buffers require numeric semantic and "
                     "subtalker sampling fields"
                 ) from exc
-            semantic_seeds.append(semantic_seed)
-            sub_temperatures.append(subtalker_temperature)
-            sub_top_ps.append(subtalker_top_p)
-            sub_top_ks.append(subtalker_top_k)
-            sub_seeds.append(subtalker_seed)
+            sampling_rows.append(
+                (
+                    semantic_seed,
+                    do_sample,
+                    subtalker_temperature,
+                    subtalker_top_p,
+                    subtalker_top_k,
+                    subtalker_seed,
+                )
+            )
             if do_sample:
-                self._sub_sample_rows.append(row_idx)
+                sampled_rows.append(row_idx)
+
+        sampling_signature = tuple(sampling_rows)
+        if sampling_signature == getattr(self, "_decode_sampling_signature", None):
+            self._decode_prep_rids = rids
+            return
+
+        semantic_seeds = [row[0] for row in sampling_rows]
+        sub_temperatures = [row[2] for row in sampling_rows]
+        sub_top_ps = [row[3] for row in sampling_rows]
+        sub_top_ks = [row[4] for row in sampling_rows]
+        sub_seeds = [row[5] for row in sampling_rows]
+        self._sub_sample_rows = sampled_rows
 
         predictor_vocab_size = int(self.config.code_predictor_config.vocab_size)
         sampled_top_ks = [sub_top_ks[row_idx] for row_idx in self._sub_sample_rows]
@@ -1057,6 +1116,7 @@ class Qwen3TTSTalker(nn.Module):
 
         if batch_size == 0:
             self._decode_prep_rids = rids
+            self._decode_sampling_signature = sampling_signature
             return
 
         device = self._sub_temperature_tensor.device
@@ -1082,6 +1142,8 @@ class Qwen3TTSTalker(nn.Module):
                 torch.tensor(self._sub_sample_rows, device=device, dtype=torch.long)
             )
         self._decode_prep_rids = rids
+        self._decode_prep_rids = rids
+        self._decode_sampling_signature = sampling_signature
 
     @torch.no_grad()
     def forward(
@@ -1252,6 +1314,25 @@ class Qwen3TTSTalker(nn.Module):
             # Note: (Jiaxin Deng) capture overwrote the staged row-indices
             # tensor; drop the reuse fingerprint so the next prepare restages.
             self._decode_prep_rids = None
+            self._decode_sampling_signature = None
+
+    @contextmanager
+    def _predictor_fused_first_token_attention_warmup_state(self):
+        """Allow the fused first-token kernel to compile before graph capture.
+
+        Triton compilation is not legal during CUDA graph capture. The graph
+        builder uses this short eager scope on its warmup stream, then captures
+        the same specialization with this flag restored to ``False``.
+        """
+
+        previous = bool(
+            getattr(self, "_predictor_fused_first_token_attention_warmup", False)
+        )
+        self._predictor_fused_first_token_attention_warmup = True
+        try:
+            yield
+        finally:
+            self._predictor_fused_first_token_attention_warmup = previous
 
     def _predictor_graph_memory_pool(self):
         # Note: (Jiaxin Deng) one shared pool across keys; private per-graph
@@ -1668,26 +1749,64 @@ class Qwen3TTSTalker(nn.Module):
 
         layer_k_cache = self._predictor_k_cache[layer_idx, :batch_size]
         layer_v_cache = self._predictor_v_cache[layer_idx, :batch_size]
-        layer_k_cache[:, :, cache_len : cache_len + 1, :].copy_(k)
-        layer_v_cache[:, :, cache_len : cache_len + 1, :].copy_(v)
-        cached_k = layer_k_cache[:, :, : cache_len + 1, :]
-        cached_v = layer_v_cache[:, :, : cache_len + 1, :]
+        key_cache_slot = layer_k_cache[:, :, cache_len : cache_len + 1, :]
+        value_cache_slot = layer_v_cache[:, :, cache_len : cache_len + 1, :]
         num_kv_groups = attn.num_heads // attn.num_kv_heads
-        if num_kv_groups == 1:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                cached_k,
-                cached_v,
-                is_causal=False,
+        first_token_attention_buffer = getattr(
+            self, "_predictor_first_token_attention_buffer", None
+        )
+        first_token_buffer = (
+            first_token_attention_buffer[:batch_size]
+            if first_token_attention_buffer is not None
+            else None
+        )
+        allow_eager_first_token_warmup = bool(
+            getattr(self, "_predictor_fused_first_token_attention_warmup", False)
+        )
+        fused_first_token_attention = (
+            cache_len == 0
+            and first_token_buffer is not None
+            and getattr(self, "_predictor_fused_first_token_attention_enabled", True)
+            and (
+                torch.cuda.is_current_stream_capturing()
+                or allow_eager_first_token_warmup
             )
+            and store_predictor_kv_and_expand_gqa_first_token(
+                q,
+                k,
+                v,
+                key_cache_slot,
+                value_cache_slot,
+                first_token_buffer,
+                allow_eager=allow_eager_first_token_warmup,
+            )
+        )
+        if fused_first_token_attention:
+            attn_output = first_token_buffer
         else:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                cached_k,
-                cached_v,
-                is_causal=False,
-                enable_gqa=True,
-            )
+            if not (
+                getattr(self, "_predictor_fused_kv_cache_enabled", True)
+                and store_predictor_kv_cache(k, v, key_cache_slot, value_cache_slot)
+            ):
+                key_cache_slot.copy_(k)
+                value_cache_slot.copy_(v)
+            cached_k = layer_k_cache[:, :, : cache_len + 1, :]
+            cached_v = layer_v_cache[:, :, : cache_len + 1, :]
+            if num_kv_groups == 1:
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    q,
+                    cached_k,
+                    cached_v,
+                    is_causal=False,
+                )
+            else:
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    q,
+                    cached_k,
+                    cached_v,
+                    is_causal=False,
+                    enable_gqa=True,
+                )
         attn_output = attn_output.transpose(1, 2).reshape(
             batch_size, attn.num_heads * attn.head_dim
         )
