@@ -336,7 +336,7 @@ def test_fused_embedding_runs_only_during_cuda_graph_capture(
     assert not calls
 
     graph_codes, graph_embeds = _run_forward(talker, layer0, hidden, positions)
-    assert len(calls) == NUM_CODE_GROUPS - 1
+    assert len(calls) == NUM_CODE_GROUPS
     assert torch.equal(graph_codes, eager_codes)
     assert torch.equal(graph_embeds, eager_embeds)
 
