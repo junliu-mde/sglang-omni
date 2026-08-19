@@ -21,15 +21,12 @@ if triton is not None:
         embedding_weight,
         gathered,
         accumulated,
-        output_token_ids,
         token_stride,
         embedding_stride,
         gathered_stride,
         accumulated_stride,
-        output_token_stride,
         hidden_size: tl.constexpr,
         block_size: tl.constexpr,
-        store_token_output: tl.constexpr,
     ):
         row = tl.program_id(0)
         block = tl.program_id(1)
@@ -45,12 +42,6 @@ if triton is not None:
         current = tl.load(accumulated_offsets, mask=mask)
         tl.store(gathered_offsets, values, mask=mask)
         tl.store(accumulated_offsets, current + values, mask=mask)
-        if store_token_output:
-            tl.store(
-                output_token_ids + row * output_token_stride,
-                token_id,
-                mask=block == 0,
-            )
 
     @triton.jit
     def _store_predictor_kv_cache_kernel(
@@ -475,14 +466,8 @@ def gather_codec_embedding_and_add(
     embedding_weight: torch.Tensor,
     gathered: torch.Tensor,
     accumulated: torch.Tensor,
-    output_token_ids: torch.Tensor | None = None,
 ) -> bool:
     """Gather BF16 embedding rows and add them to an accumulator in one launch.
-
-    When ``output_token_ids`` is present, also store each input token in its
-    corresponding output row. The output may be a positive-stride one-dimensional
-    view. This folds the Predictor's per-code-group result write into the same
-    CUDA Graph node as the embedding gather and accumulation.
 
     Return ``False`` without writes when the caller must use the eager path.
     """
@@ -510,16 +495,6 @@ def gather_codec_embedding_and_add(
         return False
     if token_ids.dtype not in (torch.int32, torch.int64):
         return False
-    if output_token_ids is not None:
-        if not (
-            output_token_ids.is_cuda
-            and output_token_ids.ndim == 1
-            and output_token_ids.shape == (batch_size,)
-            and output_token_ids.dtype == token_ids.dtype
-            and output_token_ids.device == token_ids.device
-            and output_token_ids.stride(0) > 0
-        ):
-            return False
     if (
         embedding_weight.dtype != torch.bfloat16
         or gathered.dtype != torch.bfloat16
@@ -553,11 +528,6 @@ def gather_codec_embedding_and_add(
         or _contiguous_storage_ranges_overlap(accumulated, embedding_weight)
     ):
         return False
-    if output_token_ids is not None and any(
-        _positive_stride_storage_ranges_overlap(output_token_ids, tensor)
-        for tensor in (token_ids, embedding_weight, gathered, accumulated)
-    ):
-        return False
 
     block_size = 256
     grid = (batch_size, triton.cdiv(hidden_size, block_size))
@@ -566,15 +536,12 @@ def gather_codec_embedding_and_add(
         embedding_weight,
         gathered,
         accumulated,
-        output_token_ids if output_token_ids is not None else token_ids,
         token_ids.stride(0),
         embedding_weight.stride(0),
         gathered.stride(0),
         accumulated.stride(0),
-        output_token_ids.stride(0) if output_token_ids is not None else 1,
         hidden_size=hidden_size,
         block_size=block_size,
-        store_token_output=output_token_ids is not None,
         num_warps=4,
     )
     return True
