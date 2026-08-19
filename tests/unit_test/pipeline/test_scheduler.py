@@ -1889,7 +1889,7 @@ def test_omni_scheduler_normalizes_req_token_arrays() -> None:
 def _construct_omni_scheduler(
     monkeypatch,
     *,
-    return_global_server_args: bool = False,
+    return_runtime_context: bool = False,
     server_max_queued_requests: int | None = 7,
     **kwargs,
 ) -> OmniScheduler | tuple[OmniScheduler, object]:
@@ -1919,23 +1919,24 @@ def _construct_omni_scheduler(
         raising=False,
     )
 
-    class StrictGlobalServerArgs:
+    class StrictRuntimeContext:
         def __init__(self) -> None:
-            object.__setattr__(self, "pp_max_micro_batch_size", None)
-            object.__setattr__(self, "override_calls", [])
-
-        def __setattr__(self, name, value) -> None:
-            raise AttributeError(f"bare mutation of {name}")
+            self.parallel = SimpleNamespace(pp_max_micro_batch_size=None)
+            self.override_calls = []
 
         def override(self, source, **fields) -> None:
             self.override_calls.append((source, dict(fields)))
             for name, value in fields.items():
-                object.__setattr__(self, name, value)
+                setattr(self.parallel, name, value)
 
-    global_server_args = StrictGlobalServerArgs()
+    runtime_context = StrictRuntimeContext()
     monkeypatch.setattr(
-        "sglang.srt.server_args.get_global_server_args",
-        lambda: global_server_args,
+        "sglang_omni.scheduling.omni_scheduler.get_context",
+        lambda: runtime_context,
+    )
+    monkeypatch.setattr(
+        "sglang_omni.scheduling.omni_scheduler.get_parallel",
+        lambda: runtime_context.parallel,
     )
     tp_worker = SimpleNamespace(
         gpu_id=0,
@@ -1985,15 +1986,15 @@ def _construct_omni_scheduler(
         **kwargs,
     )
 
-    if return_global_server_args:
-        return scheduler, global_server_args
+    if return_runtime_context:
+        return scheduler, runtime_context
     return scheduler
 
 
-def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
+def test_omni_scheduler_initializes_runtime_queue_limit(monkeypatch) -> None:
     """Upstream requeue helpers read max_queued_requests on OmniScheduler."""
-    scheduler, global_server_args = _construct_omni_scheduler(
-        monkeypatch, return_global_server_args=True
+    scheduler, runtime_context = _construct_omni_scheduler(
+        monkeypatch, return_runtime_context=True
     )
 
     assert scheduler._pending_chunked_abort_req is None
@@ -2005,14 +2006,99 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
     assert scheduler.max_queued_requests == 7
     assert scheduler.max_running_requests == 1
     assert scheduler.max_req_len == 63
-    assert global_server_args.pp_max_micro_batch_size == 1
-    assert global_server_args.override_calls == [
+    assert runtime_context.parallel.pp_max_micro_batch_size == 1
+    assert runtime_context.override_calls == [
         (
             "sglang_omni.scheduler.pp_max_micro_batch_size_default",
             {"pp_max_micro_batch_size": 1},
         )
     ]
     assert scheduler._abort_on_queued_limit(object()) is False
+
+
+def test_scheduler_initializes_legacy_runtime_queue_limit(monkeypatch) -> None:
+    class LegacyServerArgs:
+        def __init__(self) -> None:
+            self.pp_max_micro_batch_size = None
+            self.override_calls = []
+
+        def override(self, source, **fields) -> None:
+            self.override_calls.append((source, dict(fields)))
+            for name, value in fields.items():
+                setattr(self, name, value)
+
+    legacy_server_args = LegacyServerArgs()
+    monkeypatch.setattr(
+        "sglang_omni.scheduling.omni_scheduler.get_parallel",
+        lambda: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "sglang_omni.scheduling.omni_scheduler.get_server_args",
+        lambda: legacy_server_args,
+    )
+    monkeypatch.setattr(
+        "sglang_omni.scheduling.omni_scheduler.get_context",
+        lambda: pytest.fail("legacy SGLang must not use RuntimeContext.override"),
+    )
+
+    omni_scheduler_module._set_default_pp_max_micro_batch_size(7, 2)
+
+    assert legacy_server_args.pp_max_micro_batch_size == 3
+    assert legacy_server_args.override_calls == [
+        (
+            "sglang_omni.scheduler.pp_max_micro_batch_size_default",
+            {"pp_max_micro_batch_size": 3},
+        )
+    ]
+
+
+def test_omni_scheduler_stamps_batch_launch_time_for_sync_and_async(monkeypatch) -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.forward_ct = 0
+    scheduler._sched_idled = True
+    scheduler._emit_prefill_start_for_batch = lambda _batch: None
+    scheduler._emit_prefill_end_for_batch = lambda _batch: None
+    scheduler._build_sched_output = lambda _batch: "sched-output"
+    scheduler._emit_stream_output = lambda *_args, **_kwargs: None
+    scheduler._make_batch_result = lambda _output: "batch-result"
+
+    class Runner:
+        def execute(self, output):
+            assert output == "sched-output"
+            return "sync-output"
+
+        def execute_launch(self, output):
+            assert output == "sched-output"
+            return "pending-step"
+
+    scheduler._model_runner = Runner()
+    timestamps = iter((10.0, 11.0))
+    monkeypatch.setattr(
+        "sglang_omni.scheduling.omni_scheduler.time.monotonic",
+        lambda: next(timestamps),
+    )
+    sync_batch = SimpleNamespace(
+        launch_ts=None,
+        forward_iter=None,
+        after_idle_gap=None,
+    )
+    async_batch = SimpleNamespace(
+        launch_ts=None,
+        forward_iter=None,
+        after_idle_gap=None,
+    )
+
+    assert scheduler._run_batch(sync_batch) == "batch-result"
+    sched_output, pending_step = scheduler._run_batch_launch(async_batch)
+
+    assert sync_batch.launch_ts == 10.0
+    assert async_batch.launch_ts == 11.0
+    assert sync_batch.forward_iter == 1
+    assert async_batch.forward_iter == 2
+    assert sync_batch.after_idle_gap is True
+    assert async_batch.after_idle_gap is False
+    assert sched_output == "sched-output"
+    assert pending_step == "pending-step"
 
 
 def test_request_build_pending_limit_does_not_cap_unconfigured_backlog(

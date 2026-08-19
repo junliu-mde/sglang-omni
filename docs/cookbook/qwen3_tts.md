@@ -156,6 +156,16 @@ A closed-loop `--concurrencies 16,32,48,64` sweep is still available for
 comparing healthy vs past-ceiling points, but it does not hold overshoot. Each
 concurrency writes inspectable artifacts under `<output-dir>/c<N>/`.
 
+### Async Decode Eligibility
+
+`--decode-mode async` is opt-in. For Qwen3-TTS, it uses one-step lookahead
+only for decode batches of two or more requests whose sampling does not depend
+on generated-token history. The default `repetition_penalty: 1.05` therefore
+uses the synchronous path to preserve generation behavior. Setting
+`repetition_penalty: 1.0` can make a request eligible, but it changes the
+generation setting and requires a separate quality evaluation. Do not treat it
+as a transparent latency switch.
+
 ## Synthesizing Speech
 
 ### Text-only Requests
