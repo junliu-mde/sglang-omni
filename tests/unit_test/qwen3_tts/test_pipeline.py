@@ -45,7 +45,11 @@ from sglang_omni.scheduling.speaker_cache import (
     SpeakerCacheKey,
     get_speaker_artifact_cache,
 )
-from sglang_omni.scheduling.types import RequestOutput
+from sglang_omni.scheduling.types import (
+    PRECOMMITTED_PENALTY_CUMULATE_ATTR,
+    PrecommittedPenaltyCumulate,
+    RequestOutput,
+)
 from tests.unit_test.fakes import FakeExecutionBridge, FakeServerArgs
 
 
@@ -3131,19 +3135,19 @@ def test_qwen3_tts_async_decode_snapshots_predictor_outputs_before_resolve(
     ("repetition_penalty", "request_data", "expected"),
     [
         (1.0, SimpleNamespace(return_logprob=False), True),
-        (1.05, SimpleNamespace(return_logprob=False), False),
+        (1.05, SimpleNamespace(return_logprob=False), True),
         (1.0, SimpleNamespace(return_logprob=True), False),
         (1.0, SimpleNamespace(), False),
         (1.0, None, False),
     ],
 )
-def test_qwen3_tts_lookahead_requires_history_free_sampling(
+def test_qwen3_tts_lookahead_accepts_repetition_penalty_with_device_handoff(
     monkeypatch: pytest.MonkeyPatch,
     repetition_penalty: float,
     request_data: SimpleNamespace | None,
     expected: bool,
 ) -> None:
-    """Only raw SGLang requests with safe Omni data may use lookahead."""
+    """Device-side state handoff keeps repetition penalty safe for lookahead."""
 
     install_fake_sglang(monkeypatch)
     from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
@@ -3165,6 +3169,206 @@ def test_qwen3_tts_lookahead_requires_history_free_sampling(
     )
 
     assert runner.lookahead_eligible(batch) is expected
+
+
+@pytest.mark.parametrize(
+    "sampling_overrides",
+    [
+        {"frequency_penalty": 0.25},
+        {"presence_penalty": 0.25},
+        {"min_new_tokens": 4},
+        {
+            "repetition_penalty": 1.05,
+            "frequency_penalty": 0.25,
+            "presence_penalty": 0.25,
+            "min_new_tokens": 4,
+        },
+    ],
+)
+def test_qwen3_tts_lookahead_accepts_all_precommitted_penalty_types(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_overrides: dict[str, float | int],
+) -> None:
+    """Every SGLang output-history penalty uses the same handoff protocol."""
+
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
+
+    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    sampling_params = SimpleNamespace(
+        **{
+            "repetition_penalty": 1.0,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "min_new_tokens": 0,
+            **sampling_overrides,
+        }
+    )
+    batch = SimpleNamespace(
+        reqs=[
+            SimpleNamespace(
+                sampling_params=sampling_params,
+                _omni_data=SimpleNamespace(return_logprob=False),
+            )
+        ]
+    )
+
+    assert runner.lookahead_eligible(batch) is True
+
+
+def test_qwen3_tts_lookahead_commits_device_semantic_ids_before_next_prepare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The original scheduler sampling state receives exactly this step's ids."""
+
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
+
+    committed: list[torch.Tensor] = []
+    orchestrator = SimpleNamespace(
+        is_required=True,
+        cumulate_output_tokens=lambda token_ids: committed.append(token_ids.clone()),
+    )
+    scheduler_sampling_info = SimpleNamespace(penalizer_orchestrator=orchestrator)
+    reqs = [
+        SimpleNamespace(sampling_params=SimpleNamespace(repetition_penalty=1.05)),
+        SimpleNamespace(sampling_params=SimpleNamespace(repetition_penalty=1.0)),
+    ]
+    schedule_batch = SimpleNamespace(reqs=reqs)
+    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    result = SimpleNamespace(
+        next_token_ids=torch.tensor([17, 23, 31]),
+        _host_token_ids=torch.tensor([17, 23, 31]),
+    )
+
+    runner.commit_lookahead_sampling_state(
+        result,
+        schedule_batch,
+        scheduler_sampling_info,
+        [object(), object()],
+    )
+
+    assert len(committed) == 1
+    assert torch.equal(committed[0], torch.tensor([17, 23]))
+    marker = getattr(schedule_batch, PRECOMMITTED_PENALTY_CUMULATE_ATTR)
+    assert isinstance(marker, PrecommittedPenaltyCumulate)
+    assert marker.request_refs == (reqs[0],)
+    pending = reqs[0]._omni_lookahead_repetition_token
+    assert pending.result is result
+    assert pending.row_index == 0
+    assert not hasattr(reqs[1], "_omni_lookahead_repetition_token")
+
+
+def test_qwen3_tts_lookahead_rejects_short_semantic_id_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed graph result must not silently corrupt penalty row mapping."""
+
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
+
+    orchestrator = SimpleNamespace(is_required=True, cumulate_output_tokens=lambda _: None)
+    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    schedule_batch = SimpleNamespace(reqs=[object(), object()])
+
+    with pytest.raises(RuntimeError, match="smaller than the scheduler batch"):
+        runner.commit_lookahead_sampling_state(
+            SimpleNamespace(next_token_ids=torch.tensor([17])),
+            schedule_batch,
+            SimpleNamespace(penalizer_orchestrator=orchestrator),
+            [object(), object()],
+        )
+
+    assert not hasattr(schedule_batch, "_omni_precommitted_penalty_cumulate")
+
+
+def test_qwen3_tts_lookahead_capture_without_host_token_forces_one_sync_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Capture cannot stage DtoH ids, so the next decode must run synchronously."""
+
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
+
+    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    req = SimpleNamespace(
+        sampling_params=SimpleNamespace(repetition_penalty=1.05),
+        _omni_data=SimpleNamespace(return_logprob=False),
+    )
+    batch = SimpleNamespace(reqs=[req])
+
+    runner._stage_lookahead_repetition_tokens(SimpleNamespace(), [req])
+
+    assert runner.lookahead_eligible(batch) is False
+    assert not hasattr(req, "_omni_lookahead_repetition_token")
+
+    runner._collect_codes = lambda *_args: None
+    runner.post_decode(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        [SimpleNamespace(data=SimpleNamespace(req=req))],
+    )
+
+    assert runner.lookahead_eligible(batch) is True
+
+
+@pytest.mark.parametrize(
+    ("history", "staged_token", "expected"),
+    [
+        ([1], 2, torch.tensor([[8.0, 4.0, 3.0, 2.0]])),
+        ([2], 2, torch.tensor([[8.0, 8.0, 3.0, 2.0]])),
+    ],
+)
+def test_qwen3_tts_lookahead_repetition_handoff_matches_unique_host_history(
+    monkeypatch: pytest.MonkeyPatch,
+    history: list[int],
+    staged_token: int,
+    expected: torch.Tensor,
+) -> None:
+    """The lookahead id supplements, but never duplicates, host history."""
+
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
+
+    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    req = SimpleNamespace(
+        sampling_params=SimpleNamespace(repetition_penalty=2.0),
+        output_ids=history,
+    )
+    result = SimpleNamespace(_host_token_ids=torch.tensor([staged_token]))
+    runner._stage_lookahead_repetition_tokens(result, [req])
+    logits = torch.tensor([[8.0, 8.0, 6.0, 2.0]])
+
+    runner._apply_repetition_penalty(
+        SimpleNamespace(next_token_logits=logits),
+        [SimpleNamespace(data=SimpleNamespace(req=req))],
+    )
+
+    torch.testing.assert_close(logits, expected)
+
+
+def test_qwen3_tts_lookahead_repetition_handoff_clears_only_its_own_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolving step N must not discard the already-launched step N+1 id."""
+
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
+
+    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    req = SimpleNamespace(sampling_params=SimpleNamespace(repetition_penalty=1.05))
+    older = SimpleNamespace(_host_token_ids=torch.tensor([17]))
+    newer = SimpleNamespace(_host_token_ids=torch.tensor([23]))
+    runner._stage_lookahead_repetition_tokens(older, [req])
+    runner._stage_lookahead_repetition_tokens(newer, [req])
+    sched_req = SimpleNamespace(data=SimpleNamespace(req=req))
+
+    runner._clear_lookahead_repetition_tokens(older, [sched_req])
+    assert req._omni_lookahead_repetition_token.result is newer
+
+    runner._clear_lookahead_repetition_tokens(newer, [sched_req])
+    assert not hasattr(req, "_omni_lookahead_repetition_token")
 
 
 def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(

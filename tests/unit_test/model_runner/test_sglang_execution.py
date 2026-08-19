@@ -108,7 +108,10 @@ def test_forward_context_isolates_sampling_info_for_lookahead(monkeypatch) -> No
         lambda *_args: None,
     )
 
-    with bridge.forward_context(batch, isolate_sampling=True):
+    with bridge.forward_context(
+        batch, isolate_sampling=True
+    ) as scheduler_sampling_info:
+        assert scheduler_sampling_info is original_sampling_info
         assert batch.sampling_info == "forward-only-sampling-info"
 
     assert batch.sampling_info is original_sampling_info

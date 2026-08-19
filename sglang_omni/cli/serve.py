@@ -1335,9 +1335,10 @@ def serve(
                 "default. Async mode enables one-step lookahead, "
                 "which can overlap the previous step's host-side collect with "
                 "the next GPU forward. Available for "
-                f"{_ASYNC_DECODE_SUPPORTED_MODELS}. Qwen3-TTS uses lookahead "
-                "only when repetition_penalty is 1.0; its 1.05 default uses "
-                "synchronous decode to preserve sampling semantics."
+                f"{_ASYNC_DECODE_SUPPORTED_MODELS}. Qwen3-TTS "
+                "commits sampling state on device, so its default "
+                "repetition_penalty=1.05 is async eligible; requests for output "
+                "logprobs remain synchronous."
             ),
         ),
     ] = None,

@@ -21,9 +21,12 @@ import pytest
 import torch
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.scheduling import omni_scheduler as omni_scheduler_module
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.types import (
     ModelRunnerOutput,
+    PRECOMMITTED_PENALTY_CUMULATE_ATTR,
+    PrecommittedPenaltyCumulate,
     RequestOutput,
     SchedulerOutput,
 )
@@ -614,6 +617,192 @@ def test_async_pending_batch_uses_initialized_state():
     assert s._async_pending_batch() is None
     s._async_pending = ("batchX", "sched_out", "pending_step")
     assert s._async_pending_batch() == "batchX"
+
+
+def test_scheduler_skips_one_precommitted_penalty_update(monkeypatch):
+    """A device-side handoff replaces, rather than duplicates, host cumulation."""
+
+    precommitted = object()
+
+    class Batch:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.reqs = [precommitted]
+            setattr(
+                self,
+                PRECOMMITTED_PENALTY_CUMULATE_ATTR,
+                PrecommittedPenaltyCumulate((precommitted,)),
+            )
+
+        def cumulate_penalty_output_tokens(self) -> None:
+            self.calls += 1
+
+    batch = Batch()
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+    scheduler.running_batch = batch
+    scheduler.last_batch = None
+
+    def schedule_once(_scheduler, running_batch, _last_batch):
+        running_batch.cumulate_penalty_output_tokens()
+        return types.SimpleNamespace(
+            running_batch=running_batch,
+            batch_to_run=running_batch,
+        )
+
+    monkeypatch.setattr(
+        omni_scheduler_module._Upstream,
+        "get_next_batch_to_run",
+        schedule_once,
+    )
+
+    assert scheduler.get_next_batch_to_run() is batch
+    assert batch.calls == 0
+    assert not hasattr(batch, PRECOMMITTED_PENALTY_CUMULATE_ATTR)
+
+    batch.cumulate_penalty_output_tokens()
+    assert batch.calls == 1
+
+
+def test_scheduler_retains_unconsumed_precommitted_penalty_update(monkeypatch):
+    """A prefill-only scheduling pass must not consume a future decode handoff."""
+
+    precommitted = object()
+    marker = PrecommittedPenaltyCumulate((precommitted,))
+    batch = types.SimpleNamespace(
+        reqs=[precommitted],
+        **{PRECOMMITTED_PENALTY_CUMULATE_ATTR: marker},
+    )
+    batch.cumulate_penalty_output_tokens = mock.Mock()
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+    scheduler.running_batch = batch
+    scheduler.last_batch = None
+
+    monkeypatch.setattr(
+        omni_scheduler_module._Upstream,
+        "get_next_batch_to_run",
+        lambda _scheduler, running_batch, _last_batch: types.SimpleNamespace(
+            running_batch=running_batch,
+            batch_to_run=None,
+        ),
+    )
+
+    assert scheduler.get_next_batch_to_run() is None
+    assert getattr(batch, PRECOMMITTED_PENALTY_CUMULATE_ATTR) is marker
+    batch.cumulate_penalty_output_tokens.assert_not_called()
+
+
+def test_scheduler_discards_precommitted_marker_after_its_rows_finish(monkeypatch):
+    """A finished handoff cannot suppress a later request's first host update."""
+
+    precommitted = object()
+    survivor = object()
+    admitted = object()
+
+    class Batch:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.reqs = [precommitted]
+            setattr(
+                self,
+                PRECOMMITTED_PENALTY_CUMULATE_ATTR,
+                PrecommittedPenaltyCumulate((precommitted,)),
+            )
+
+        def cumulate_penalty_output_tokens(self) -> None:
+            self.calls += 1
+
+    batch = Batch()
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+    scheduler.running_batch = batch
+    scheduler.last_batch = None
+    passes = 0
+
+    def schedule_once(_scheduler, running_batch, _last_batch):
+        nonlocal passes
+        if passes == 0:
+            running_batch.reqs = [survivor]
+            batch_to_run = None
+        else:
+            running_batch.reqs = [admitted]
+            running_batch.cumulate_penalty_output_tokens()
+            batch_to_run = running_batch
+        passes += 1
+        return types.SimpleNamespace(
+            running_batch=running_batch,
+            batch_to_run=batch_to_run,
+        )
+
+    monkeypatch.setattr(
+        omni_scheduler_module._Upstream,
+        "get_next_batch_to_run",
+        schedule_once,
+    )
+
+    assert scheduler.get_next_batch_to_run() is None
+    assert not hasattr(batch, PRECOMMITTED_PENALTY_CUMULATE_ATTR)
+    assert scheduler.get_next_batch_to_run() is batch
+    assert batch.calls == 1
+
+
+def test_scheduler_preserves_only_current_precommitted_rows_after_filter(
+    monkeypatch,
+):
+    """A finished row cannot shift the restore set away from a newly merged row."""
+
+    finished = object()
+    precommitted = object()
+    admitted = object()
+
+    class Penalizer:
+        def __init__(self) -> None:
+            self.state = torch.tensor([[100.0], [10.0], [20.0]])
+
+    class Batch:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.reqs = [finished, precommitted, admitted]
+            self.penalizer = Penalizer()
+            self.sampling_info = types.SimpleNamespace(
+                penalizer_orchestrator=types.SimpleNamespace(
+                    penalizers={"test": self.penalizer}
+                )
+            )
+            setattr(
+                self,
+                PRECOMMITTED_PENALTY_CUMULATE_ATTR,
+                PrecommittedPenaltyCumulate((finished, precommitted)),
+            )
+
+        def cumulate_penalty_output_tokens(self) -> None:
+            self.calls += 1
+            self.penalizer.state.add_(torch.tensor([[1.0], [7.0]]))
+
+    batch = Batch()
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+    scheduler.running_batch = batch
+    scheduler.last_batch = None
+
+    def schedule_once(_scheduler, running_batch, _last_batch):
+        # Match ScheduleBatch.filter_batch(): the finished row disappears and
+        # each remaining state tensor shifts to its current row index.
+        running_batch.reqs = [precommitted, admitted]
+        running_batch.penalizer.state = running_batch.penalizer.state[1:].clone()
+        running_batch.cumulate_penalty_output_tokens()
+        return types.SimpleNamespace(
+            running_batch=running_batch,
+            batch_to_run=running_batch,
+        )
+
+    monkeypatch.setattr(
+        omni_scheduler_module._Upstream,
+        "get_next_batch_to_run",
+        schedule_once,
+    )
+
+    assert scheduler.get_next_batch_to_run() is batch
+    assert batch.calls == 1
+    assert torch.equal(batch.penalizer.state, torch.tensor([[10.0], [27.0]]))
+    assert not hasattr(batch, PRECOMMITTED_PENALTY_CUMULATE_ATTR)
 
 
 # ---------------------------------------------------------------------------

@@ -83,8 +83,14 @@ class SGLangExecutionBridge:
         batch: Any,
         *,
         isolate_sampling: bool = False,
-    ) -> Iterator[None]:
-        """Resolve inputs and optionally isolate lookahead sampling state."""
+    ) -> Iterator[Any | None]:
+        """Resolve inputs and optionally isolate lookahead sampling state.
+
+        Yield the mutable scheduler-owned sampling state. A lookahead runner can
+        use it to commit a just-sampled device token before the next scheduler
+        decode preparation, while the forward itself continues to use its
+        isolated copy.
+        """
         from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 
         resolve_forward_inputs(batch, self.future_map)
@@ -93,7 +99,7 @@ class SGLangExecutionBridge:
         if isolate_sampling and scheduler_sampling_info is not None:
             batch.sampling_info = scheduler_sampling_info.copy_for_forward()
         try:
-            yield
+            yield scheduler_sampling_info
         finally:
             if isolate_sampling:
                 batch.sampling_info = scheduler_sampling_info

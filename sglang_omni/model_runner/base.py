@@ -360,7 +360,9 @@ class ModelRunner:
         schedule_batch = scheduler_output.batch_data
         if schedule_batch is None:
             return None
-        with self._execution_context(schedule_batch, isolate_sampling=True):
+        with self._execution_context(
+            schedule_batch, isolate_sampling=True
+        ) as scheduler_sampling_info:
             built = self._build_forward_batch(scheduler_output)
             if built is None:
                 return None
@@ -386,6 +388,12 @@ class ModelRunner:
                 batch_result,
                 forward_batch,
                 schedule_batch,
+                scheduler_output.requests,
+            )
+            self.commit_lookahead_sampling_state(
+                batch_result,
+                schedule_batch,
+                scheduler_sampling_info,
                 scheduler_output.requests,
             )
             event = self._execution_bridge.record_completion()
@@ -802,6 +810,24 @@ class ModelRunner:
         if launch_buf is None or not requests:
             return
         result.next_token_ids = launch_buf[: len(requests)]
+
+    def commit_lookahead_sampling_state(
+        self,
+        result: Any,
+        schedule_batch: Any,
+        scheduler_sampling_info: Any,
+        requests: list,
+    ) -> None:
+        """Commit state that the next lookahead decode must observe.
+
+        ``execute_launch`` calls this after the next-token relay is published
+        and before its completion event is recorded. The default leaves
+        scheduler state unchanged. Runners with output-history-dependent
+        sampling can override it and arrange for the next
+        ``ScheduleBatch.prepare_for_decode`` to skip its host-history update.
+        """
+
+        del result, schedule_batch, scheduler_sampling_info, requests
 
     def sample_before_post_prefill(
         self, forward_batch: Any, schedule_batch: Any, requests: list
