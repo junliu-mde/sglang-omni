@@ -21,6 +21,7 @@ import types
 from array import array
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 from itertools import islice
 from typing import Any, Callable
 
@@ -544,7 +545,13 @@ class OmniScheduler:
         self._model_runner = model_runner
         dp_attn_adapter = self.__dict__.get("dp_attn_adapter")
         if dp_attn_adapter is not None and hasattr(dp_attn_adapter, "model_runner"):
-            dp_attn_adapter.model_runner = model_runner
+            dataclass_params = getattr(type(dp_attn_adapter), "__dataclass_params__", None)
+            if dataclass_params is not None and dataclass_params.frozen:
+                self.dp_attn_adapter = replace(
+                    dp_attn_adapter, model_runner=model_runner
+                )
+            else:
+                dp_attn_adapter.model_runner = model_runner
         self._execution_bridge = bridge
         self.future_map = bridge.future_map
 
