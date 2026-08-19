@@ -2917,6 +2917,42 @@ def test_qwen3_tts_prefill_prepares_subtalker_buffers_before_forward(
     assert calls == ["prepare", "embeds", "forward"]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qwen3_tts_stages_semantic_ids_at_forward_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Start reporting-token DtoH before the Predictor can consume the step."""
+
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.model_runner.base import ModelRunner
+    from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
+
+    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    result = SimpleNamespace(next_token_ids=torch.tensor([7, 11], device="cuda"))
+    staged: list[tuple[object, torch.Tensor]] = []
+
+    monkeypatch.setattr(
+        ModelRunner,
+        "_prepare_and_forward",
+        lambda *_args, **_kwargs: result,
+    )
+    runner._stage_token_ids = lambda observed_result, observed_ids: staged.append(
+        (observed_result, observed_ids)
+    )
+
+    returned = runner._prepare_and_forward(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        [],
+        is_prefill=False,
+    )
+
+    assert returned is result
+    assert len(staged) == 1
+    assert staged[0][0] is result
+    assert staged[0][1] is result.next_token_ids
+
+
 def test_qwen3_tts_sampling_installs_semantic_seed_tensor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
