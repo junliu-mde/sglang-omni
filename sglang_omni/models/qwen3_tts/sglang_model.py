@@ -146,6 +146,7 @@ class _PredictorDecodeGraph:
             warmup_stream.wait_stream(current_stream)
             with (
                 torch.cuda.stream(warmup_stream),
+                model._predictor_fused_embedding_warmup_state(),
                 model._predictor_fused_first_token_attention_warmup_state(),
             ):
                 for _ in range(2):
@@ -562,6 +563,7 @@ class Qwen3TTSTalker(nn.Module):
         self._predictor_fused_first_token_attention_enabled = (
             _predictor_fused_first_token_attention_env_enabled()
         )
+        self._predictor_fused_embedding_warmup = False
         self._predictor_fused_first_token_attention_warmup = False
         _bind_default_weight_loaders(self)
         self._cached_params_dict = dict(self.named_parameters())
@@ -1317,6 +1319,22 @@ class Qwen3TTSTalker(nn.Module):
             self._decode_sampling_signature = None
 
     @contextmanager
+    def _predictor_fused_embedding_warmup_state(self):
+        """Compile the fused embedding specialization before graph capture.
+
+        The Predictor only uses this kernel in its CUDA Graph. The graph builder
+        runs the same fixed-shape operation twice on a side stream first so
+        Triton compilation and module loading cannot occur during capture.
+        """
+
+        previous = bool(getattr(self, "_predictor_fused_embedding_warmup", False))
+        self._predictor_fused_embedding_warmup = True
+        try:
+            yield
+        finally:
+            self._predictor_fused_embedding_warmup = previous
+
+    @contextmanager
     def _predictor_fused_first_token_attention_warmup_state(self):
         """Allow the fused first-token kernel to compile before graph capture.
 
@@ -1442,10 +1460,16 @@ class Qwen3TTSTalker(nn.Module):
             embedding_buffer = embedding_buffer[:batch_size]
         # Capture Predictor embedding work into a graph; standalone Triton
         # launches lose to ATen outside graph replay.
+        allow_eager_embedding_warmup = bool(
+            getattr(self, "_predictor_fused_embedding_warmup", False)
+        )
         use_fused_embedding = (
             embedding_buffer is not None
             and layer0_codes.is_cuda
-            and torch.cuda.is_current_stream_capturing()
+            and (
+                torch.cuda.is_current_stream_capturing()
+                or allow_eager_embedding_warmup
+            )
         )
 
         for pos in range(seq_len):
