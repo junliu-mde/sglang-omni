@@ -528,6 +528,9 @@ class OmniScheduler:
         # Keep the upstream attribute available to delegated scheduler methods,
         # but make the custom ModelRunner the sole owner of relay.
         self._model_runner = model_runner
+        dp_attn_adapter = getattr(self, "dp_attn_adapter", None)
+        if dp_attn_adapter is not None:
+            dp_attn_adapter.model_runner = model_runner
         self._execution_bridge = bridge
         self.future_map = bridge.future_map
 
