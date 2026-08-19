@@ -738,6 +738,36 @@ def test_omni_scheduler_custom_runner_stamps_upstream_launch_metadata() -> None:
     assert async_batch.after_idle_gap is False
 
 
+def test_omni_scheduler_async_resolve_uses_staged_host_token_ids() -> None:
+    """Async result processing must not convert the GPU token tensor to a list.
+
+    The runner stages reporting tokens in pinned host memory before resolving a
+    lookahead step. The async bridge must pass that staged tensor to SGLang's
+    result processor, exactly as the synchronous bridge does.
+    """
+
+    device_ids = torch.tensor([10, 20], dtype=torch.int32)
+    host_ids = torch.tensor([10, 20], dtype=torch.int32)
+
+    class FakeModelRunner:
+        def execute_resolve(self, _pending_step):
+            return ModelRunnerOutput(
+                outputs={},
+                can_run_cuda_graph=True,
+                next_token_ids=device_ids,
+                host_token_ids=host_ids,
+            )
+
+    scheduler = object.__new__(OmniScheduler)
+    scheduler._model_runner = FakeModelRunner()
+    scheduler._stream_output_builder = None
+
+    result = scheduler._run_batch_resolve(object(), object(), object())
+
+    assert result.next_token_ids is host_ids
+    assert result.can_run_cuda_graph is True
+
+
 def test_omni_scheduler_resolve_drops_retracted_req() -> None:
     """A request retracted (KV freed, back to waiting) while its lagged async
     step was in flight must be dropped from the resolve batch — skip_rids plus
