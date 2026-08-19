@@ -1483,7 +1483,7 @@ class Qwen3TTSTalker(nn.Module):
                     layer_idx,
                     semantic_positions=semantic_positions[:, pos],
                 )
-                pos_codes[:, layer_idx + 1].copy_(next_code)
+                output_token_ids = pos_codes[:, layer_idx + 1]
                 codec_embedding = self.code_predictor.model.codec_embedding[layer_idx]
                 fused_embedding = (
                     use_fused_embedding
@@ -1493,11 +1493,13 @@ class Qwen3TTSTalker(nn.Module):
                         codec_embedding.weight,
                         embedding_buffer,
                         pos_summed,
+                        output_token_ids=output_token_ids,
                     )
                 )
                 if fused_embedding:
                     new_embed = embedding_buffer.unsqueeze(1)
                 else:
+                    output_token_ids.copy_(next_code)
                     new_embed = codec_embedding(next_code.unsqueeze(1)).to(
                         dtype=predictor_dtype
                     )

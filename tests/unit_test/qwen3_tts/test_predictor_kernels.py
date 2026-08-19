@@ -22,17 +22,21 @@ def test_gather_codec_embedding_and_add_cpu_falls_back_without_writes():
     embedding_weight = torch.randn(8, 4, dtype=torch.bfloat16)
     gathered = torch.full((2, 4), 2.0, dtype=torch.bfloat16)
     accumulated = torch.full((2, 4), -3.0, dtype=torch.bfloat16)
+    output_token_ids = torch.full((2,), -7, dtype=torch.long)
     expected_gathered = gathered.clone()
     expected_accumulated = accumulated.clone()
+    expected_output_token_ids = output_token_ids.clone()
 
     assert not gather_codec_embedding_and_add(
         token_ids,
         embedding_weight,
         gathered,
         accumulated,
+        output_token_ids=output_token_ids,
     )
     assert torch.equal(gathered, expected_gathered)
     assert torch.equal(accumulated, expected_accumulated)
+    assert torch.equal(output_token_ids, expected_output_token_ids)
 
 
 def test_store_predictor_kv_cache_cpu_falls_back_without_writes():
@@ -361,14 +365,46 @@ def test_gather_codec_embedding_and_add_matches_bf16_reference(
     expected_accumulated = accumulated.clone()
     expected_accumulated.add_(expected_gathered)
     gathered = torch.empty_like(expected_gathered)
+    output_token_storage = torch.full(
+        (batch_size, 2), -1, dtype=torch.long, device=device
+    )
+    output_token_ids = output_token_storage[:, 1]
 
     assert gather_codec_embedding_and_add(
         token_ids,
         embedding_weight,
         gathered,
         accumulated,
+        output_token_ids=output_token_ids,
     )
     torch.cuda.synchronize()
 
     assert torch.equal(gathered, expected_gathered)
     assert torch.equal(accumulated, expected_accumulated)
+    assert torch.equal(output_token_ids, token_ids)
+    assert torch.equal(output_token_storage[:, 0], torch.full_like(token_ids, -1))
+
+
+@pytest.mark.skipif(not _HAS_CUDA, reason="Triton Predictor kernel needs CUDA")
+def test_gather_codec_embedding_and_add_rejects_overlapping_token_output_without_writes():
+    device = torch.device("cuda")
+    token_ids = torch.tensor([1, 3], dtype=torch.long, device=device)
+    embedding_weight = torch.randn(8, 8, dtype=torch.bfloat16, device=device)
+    gathered = torch.full((2, 8), 2.0, dtype=torch.bfloat16, device=device)
+    accumulated = torch.full((2, 8), -3.0, dtype=torch.bfloat16, device=device)
+    expected_gathered = gathered.clone()
+    expected_accumulated = accumulated.clone()
+    expected_token_ids = token_ids.clone()
+
+    assert not gather_codec_embedding_and_add(
+        token_ids,
+        embedding_weight,
+        gathered,
+        accumulated,
+        output_token_ids=token_ids,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(gathered, expected_gathered)
+    assert torch.equal(accumulated, expected_accumulated)
+    assert torch.equal(token_ids, expected_token_ids)

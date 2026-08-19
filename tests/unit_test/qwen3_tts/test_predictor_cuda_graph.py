@@ -320,9 +320,12 @@ def test_fused_embedding_runs_only_during_cuda_graph_capture(
     original_kernel = sglang_model_module.gather_codec_embedding_and_add
     calls = []
 
-    def _record_kernel(*args):
+    def _record_kernel(*args, **kwargs):
+        output_token_ids = kwargs["output_token_ids"]
+        assert output_token_ids.ndim == 1
+        assert output_token_ids.stride(0) == NUM_CODE_GROUPS
         calls.append(None)
-        return original_kernel(*args)
+        return original_kernel(*args, **kwargs)
 
     monkeypatch.setattr(
         sglang_model_module,
