@@ -178,7 +178,6 @@ def _build_talker(device: torch.device) -> Qwen3TTSTalker:
     talker._predictor_graph_pool = None
     talker._predictor_fused_kv_cache_enabled = True
     talker._predictor_fused_first_token_attention_enabled = True
-    talker._predictor_fused_embedding_warmup = False
     talker._predictor_fused_attention_enabled = True
     return talker
 
@@ -311,7 +310,7 @@ def test_missing_embedding_buffer_uses_original_graph_path():
 
 
 @pytest.mark.skipif(not _HAS_CUDA, reason="predictor CUDA graph needs CUDA")
-def test_fused_embedding_warms_before_cuda_graph_capture(
+def test_fused_embedding_runs_only_during_cuda_graph_capture(
     monkeypatch: pytest.MonkeyPatch,
 ):
     device = torch.device("cuda")
@@ -325,7 +324,7 @@ def test_fused_embedding_warms_before_cuda_graph_capture(
         output_token_ids = kwargs["output_token_ids"]
         assert output_token_ids.ndim == 1
         assert output_token_ids.stride(0) == NUM_CODE_GROUPS
-        calls.append(torch.cuda.is_current_stream_capturing())
+        calls.append(None)
         return original_kernel(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -337,8 +336,7 @@ def test_fused_embedding_warms_before_cuda_graph_capture(
     assert not calls
 
     graph_codes, graph_embeds = _run_forward(talker, layer0, hidden, positions)
-    assert calls.count(False) == 2 * NUM_CODE_GROUPS
-    assert calls.count(True) == NUM_CODE_GROUPS
+    assert len(calls) == NUM_CODE_GROUPS
     assert torch.equal(graph_codes, eager_codes)
     assert torch.equal(graph_embeds, eager_embeds)
 
