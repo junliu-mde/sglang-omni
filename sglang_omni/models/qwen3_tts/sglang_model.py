@@ -10,6 +10,7 @@ from typing import Any, Iterable, Optional, Tuple
 
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import multinomial_with_seed
 from sglang.srt.utils import add_prefix
 from torch import nn
@@ -1691,7 +1692,7 @@ class Qwen3TTSTalker(nn.Module):
             residual = hidden_states
             normed = layer.input_layernorm(hidden_states.reshape(-1, hidden_size))
             normed = normed.reshape(batch_size, 1, hidden_size)
-            attn_out = self._predictor_cached_self_attention(
+            attn_input = self._predictor_cached_self_attention(
                 layer_idx=layer_idx,
                 attn=layer.self_attn,
                 hidden_states=normed,
@@ -1699,7 +1700,11 @@ class Qwen3TTSTalker(nn.Module):
                 batch_size=batch_size,
                 cache_len=cache_len,
             )
-            hidden_states = residual + attn_out
+            hidden_states = self._predictor_o_proj_add_residual(
+                layer.self_attn.o_proj,
+                attn_input,
+                residual,
+            )
             residual = hidden_states
             normed = layer.post_attention_layernorm(
                 hidden_states.reshape(-1, hidden_size)
@@ -1710,6 +1715,59 @@ class Qwen3TTSTalker(nn.Module):
             hidden_states.reshape(-1, hidden_size)
         )
         return hidden_states.reshape(batch_size, 1, hidden_size)
+
+    @staticmethod
+    def _predictor_o_proj_add_residual(
+        o_proj: nn.Module,
+        attn_input: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the Predictor attention output projection and residual add."""
+
+        weight = getattr(o_proj, "weight", None)
+        use_fused_addmm = (
+            attn_input.is_cuda
+            and torch.cuda.is_current_stream_capturing()
+            and not torch.is_grad_enabled()
+            and torch.cuda.get_device_capability(attn_input.device) == (9, 0)
+            and isinstance(
+                getattr(o_proj, "quant_method", None), UnquantizedLinearMethod
+            )
+            and getattr(o_proj, "tp_size", None) == 1
+            and getattr(o_proj, "bias", None) is None
+            and isinstance(weight, torch.Tensor)
+            and weight.is_cuda
+            and weight.dtype == torch.bfloat16
+            and weight.ndim == 2
+            and weight.is_contiguous()
+            and attn_input.dtype == torch.bfloat16
+            and attn_input.ndim == 2
+            and attn_input.is_contiguous()
+            and attn_input.device == weight.device
+            and attn_input.shape[1] == weight.shape[1]
+            and residual.is_cuda
+            and residual.dtype == torch.bfloat16
+            and residual.ndim == 3
+            and residual.is_contiguous()
+            and residual.device == weight.device
+            and residual.shape == (attn_input.shape[0], 1, weight.shape[0])
+        )
+        if use_fused_addmm:
+            residual_2d = residual.reshape(attn_input.shape[0], weight.shape[0])
+            # The caller replaces ``residual`` immediately after this call.
+            # Reuse its storage so addmm's beta term needs no separate copy.
+            torch.addmm(
+                residual_2d,
+                attn_input,
+                weight.t(),
+                out=residual_2d,
+            )
+            return residual
+
+        attn_output, _ = o_proj(attn_input)
+        return residual + attn_output.reshape(
+            attn_input.shape[0], 1, residual.shape[-1]
+        )
 
     def _predictor_cached_self_attention(
         self,
@@ -1810,8 +1868,7 @@ class Qwen3TTSTalker(nn.Module):
         attn_output = attn_output.transpose(1, 2).reshape(
             batch_size, attn.num_heads * attn.head_dim
         )
-        attn_output, _ = attn.o_proj(attn_output)
-        return attn_output.reshape(batch_size, 1, hidden_size)
+        return attn_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = self._cached_params_dict

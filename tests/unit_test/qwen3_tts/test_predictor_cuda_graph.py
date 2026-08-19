@@ -48,6 +48,16 @@ class _TupleLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int) -> None:
         super().__init__()
         self.proj = nn.Linear(in_features, out_features, bias=False)
+        self.quant_method = sglang_model_module.UnquantizedLinearMethod()
+        self.tp_size = 1
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.proj.weight
+
+    @property
+    def bias(self) -> None:
+        return None
 
     def forward(self, hidden_states: torch.Tensor):
         return self.proj(hidden_states), None
@@ -334,6 +344,35 @@ def test_fused_embedding_runs_only_during_cuda_graph_capture(
 
     graph_codes, graph_embeds = _run_forward(talker, layer0, hidden, positions)
     assert len(calls) == NUM_CODE_GROUPS - 1
+    assert torch.equal(graph_codes, eager_codes)
+    assert torch.equal(graph_embeds, eager_embeds)
+
+
+@pytest.mark.skipif(not _HAS_CUDA, reason="predictor CUDA graph needs CUDA")
+@pytest.mark.parametrize("batch_size", [1, 4, 8, 16])
+def test_fused_o_proj_residual_runs_only_during_cuda_graph_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    batch_size: int,
+):
+    device = torch.device("cuda")
+    talker = _build_talker(device)
+    talker.prepare_decode_buffers(_uniform_requests(batch_size))
+    layer0, hidden, positions = _step_inputs(batch_size, device)
+    original_addmm = torch.addmm
+    calls = []
+
+    def _record_addmm(input, *args, **kwargs):
+        assert kwargs["out"] is input
+        calls.append(None)
+        return original_addmm(input, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "addmm", _record_addmm)
+
+    eager_codes, eager_embeds = _run_eager(talker, layer0, hidden, positions)
+    assert not calls
+
+    graph_codes, graph_embeds = _run_forward(talker, layer0, hidden, positions)
+    assert len(calls) == NUM_CODE_GROUPS
     assert torch.equal(graph_codes, eager_codes)
     assert torch.equal(graph_embeds, eager_embeds)
 
