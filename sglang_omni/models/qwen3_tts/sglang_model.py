@@ -1440,8 +1440,7 @@ class Qwen3TTSTalker(nn.Module):
         embedding_buffer = getattr(self, "_predictor_embedding_buffer", None)
         if embedding_buffer is not None:
             embedding_buffer = embedding_buffer[:batch_size]
-        # Capture Predictor embedding work into a graph; standalone Triton
-        # launches lose to ATen outside graph replay.
+        # Capture P2 into a graph; standalone Triton launch loses to ATen.
         use_fused_embedding = (
             embedding_buffer is not None
             and layer0_codes.is_cuda
@@ -1450,33 +1449,18 @@ class Qwen3TTSTalker(nn.Module):
 
         for pos in range(seq_len):
             layer0_code = layer0_codes[:, pos : pos + 1]
+            layer0_embed = self.get_input_embeddings()(layer0_code).to(
+                dtype=predictor_dtype
+            )
+            layer0_predictor_embed = self.code_predictor.project_input(layer0_embed)
             pos_codes = result_codes[:, :, pos]
             pos_summed = summed_embeddings[:, pos, :]
             pos_summed.zero_()
-            input_embedding = self.get_input_embeddings()
-            input_embedding_weight = getattr(input_embedding, "weight", None)
-            fused_layer0_embedding = (
-                use_fused_embedding
-                and isinstance(input_embedding_weight, torch.Tensor)
-                and embedding_buffer.dtype == predictor_dtype
-                and gather_codec_embedding_and_add(
-                    layer0_code[:, 0],
-                    input_embedding_weight,
-                    embedding_buffer,
-                    pos_summed,
-                    output_token_ids=pos_codes[:, 0],
-                )
-            )
-            if fused_layer0_embedding:
-                layer0_embed = embedding_buffer.unsqueeze(1)
-            else:
-                layer0_embed = input_embedding(layer0_code).to(dtype=predictor_dtype)
-                pos_codes[:, 0].copy_(layer0_code[:, 0])
-                pos_summed.add_(layer0_embed[:, 0, :])
-            layer0_predictor_embed = self.code_predictor.project_input(layer0_embed)
             talker_predictor_embed = self.code_predictor.project_input(
                 talker_hidden[:, pos : pos + 1, :]
             ).to(dtype=predictor_dtype)
+            pos_codes[:, 0].copy_(layer0_code[:, 0])
+            pos_summed.add_(layer0_embed[:, 0, :])
 
             cache_len = 0
             self._predictor_forward_one_token(
