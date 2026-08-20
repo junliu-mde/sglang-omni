@@ -492,13 +492,14 @@ class Qwen3TTSModelRunner(ModelRunner):
         rep_mask, sup_mask, pen_col = self._shape_masks
         fingerprint = self._mask_fingerprint(requests)
         last_sampled = getattr(self, "_mask_last_sampled", None)
-        if (
+        incremental_mask_update = (
             fingerprint is not None
             and fingerprint == getattr(self, "_mask_prep_rids", None)
             and last_sampled is not None
             and last_sampled.shape[0] >= batch_size
             and self._every_row_grew_by_one(requests)
-        ):
+        )
+        if incremental_mask_update:
             # Note: (Jiaxin Deng) unchanged batch, every history exactly one token
             # longer: the only new information is each row's sampled token, so one
             # scatter replaces the full host-side index rebuild. A history that did
@@ -522,7 +523,8 @@ class Qwen3TTSModelRunner(ModelRunner):
             logits.copy_(
                 torch.where(rep_mask[:batch_size], penalized, scores).to(logits.dtype)
             )
-        self._apply_lookahead_repetition_token(logits, requests)
+        if not incremental_mask_update:
+            self._apply_lookahead_repetition_token(logits, requests)
 
     def _apply_codec_suppress_tokens(self, logits_output: Any, requests: list) -> None:
         logits = logits_output.next_token_logits

@@ -77,6 +77,24 @@ def test_mask_shaping_steady_steps_match_reference():
         runner._mask_last_sampled = torch.tensor([new_a, new_b])
 
 
+def test_mask_shaping_incremental_lookahead_token_is_penalized_once():
+    runner = _runner()
+    reqs = [_request("a", 1, 2.0, [1], [])]
+    _apply(runner, torch.full((1, 4), 8.0), reqs)
+
+    req = reqs[0].data.req
+    req.output_ids = [1, 2]
+    runner._mask_last_sampled = torch.tensor([3])
+    runner._stage_lookahead_repetition_tokens(
+        types.SimpleNamespace(_host_token_ids=torch.tensor([3])),
+        [req],
+    )
+
+    got = _apply(runner, torch.full((1, 4), 8.0), reqs)
+
+    assert got[0, 3] == 4.0
+
+
 def test_mask_shaping_rebuilds_on_rid_reuse():
     torch.manual_seed(4)
     vocab = 64
