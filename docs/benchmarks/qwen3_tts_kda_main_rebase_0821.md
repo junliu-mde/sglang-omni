@@ -7,18 +7,22 @@ wall-time median by 20.9%, the C1 engine-time median by 21.9%, the controlled C4
 wall-time median by 18.2%, and the controlled C8 wall-time median by 9.3%
 relative to the bracketed original-main baseline.
 
-The exact-output gate passes on the standard matrix: C1 is byte-identical, and
-every one of the 40 C4 and 80 C8 candidate WAV hashes occurs in the original-main
-reference set. The Cn gate compares each WAV independently. It does not pair
-runs or scheduler layouts and does not use an audio tolerance.
+The standard matrix observes byte-identical C1 output and main-reference
+membership for all 40 C4 and 80 C8 rebase WAVs. An expanded C8 audit shows that
+finite hash-set membership is not a complete parity gate: a main-equivalent
+repeat also produces a hash absent from the earlier main set. A separate
+correctness-only run fixes both the C8 prefill layout and vocoder execution. It
+passes 160/160 exact WAV comparisons between original main and the rebase.
 
 Crossed multi-round tests do not support enabling async lookahead by default.
 Async is 4.0% slower on short C4 and 8.1% slower on short C8. The long C4 and C8
 changes are +1.0% and +0.4%. A separate threshold-9 isolation shows that the
 async server configuration without lookahead changes C4 by only -0.6%. This
 rules out the server configuration as the cause of the C4 regression. The C8
-isolation changes latency by +1.1%, but its exact-output gate fails, so it is
-directional evidence only and does not establish C8 attribution.
+isolation changes latency by +1.1%. Its five hashes outside the earlier main set
+also occur on the synchronous Predictor branch, while a main-equivalent repeat
+independently falls outside that set. The isolation therefore cannot attribute
+the C8 change to async.
 
 ## Revisions and protocol
 
@@ -53,7 +57,7 @@ drift while retaining both observed main results.
 | Controlled C4 wall median | 1.382967 s | 1.371367 s | 1.377167 s | 1.126911 s | **-18.2%** |
 | Controlled C8 wall median | 1.522798 s | 1.460790 s | 1.491794 s | 1.352928 s | **-9.3%** |
 
-## Exact-output gate
+## Output checks
 
 Every C1 arm produced this WAV SHA-256:
 
@@ -64,17 +68,61 @@ c4d7988da4eac5065dd3cc90c05b27f6f73c5a85e18b52794450636e0cb961e2
 All ten C1 repetitions in every arm are byte-identical.
 
 For C4 and C8, scheduler timing can change the run-level hash multiset even
-under controlled endpoint arrival. The correctness rule is therefore:
+under one batch-endpoint arrival group. The benchmark client's finite-reference
+check is:
 
 1. Build a reference set from every exact WAV SHA-256 observed in the
    corresponding original-main reports.
 2. Require every candidate WAV SHA-256 to occur in that set.
-3. Fail on any unseen hash. Do not pair runs or scheduler layouts.
+3. Report any unseen hash. Do not pair runs or scheduler layouts.
 4. Retain each run-level hash multiset only as a layout observation.
 5. Do not use numeric or audio tolerance.
 
-The rebase result is 40/40 exact C4 hashes and 80/80 exact C8 hashes matched to
-the original-main reference sets.
+The standard rebase result is 40/40 C4 hashes and 80/80 C8 hashes matched to the
+available original-main sets. This is an observed result, not proof that the
+sets contain every output reachable under later scheduler and vocoder layouts.
+
+### Expanded C8 audit
+
+The expanded reference is the union of the standard main-before and main-after
+runs plus 100 additional original-main C8 runs. It contains 12 hashes.
+
+| Arm | Serving revision | WAVs matching the finite set | Unseen WAVs |
+| --- | --- | ---: | ---: |
+| Main-equivalent repeat | `91d4359fa06d1b60834250624116318ffa448e18` | 799/800 | 1 |
+| Rebase sync | `57ab62adf96fcc9342a79dab21f4a87eec38add2` | 794/800 | 6 |
+| Threshold-9, lookahead bypassed | `57ab62adf96fcc9342a79dab21f4a87eec38add2` | 75/80 | 5 |
+
+Revision `91d4359` differs from original main `c6bbcc8` only in release metadata
+and documentation. It has no serving-code change. Its unseen hash is therefore
+a same-code false negative for finite membership. The rebase rows above cannot
+establish either parity or a regression without fixing all output-affecting
+layouts.
+
+### Fixed-layout C8 parity
+
+The correctness-only protocol fixes those layouts:
+
+- Hold prefill until all eight requests are waiting, with a 500 ms escape
+  deadline. Server logs confirm one 8-request prefill for every measured run.
+- Decode each vocoder item independently with deterministic vocoder inference
+  and disable the initial vocoder CUDA Graph.
+- Keep Talker `torch.compile` off and its C8 decode CUDA Graph enabled.
+- Run one warm-up and 20 measured C8 batches per arm.
+
+Original main and final rebase each produce the same single WAV SHA-256 for all
+160 measured WAVs:
+
+```text
+da3fc6523d8ffe2dd3b0cfd303de1841238582c129520609eed9d13b396ab98d
+```
+
+The rebase result is 160/160 byte-identical WAVs against original main. The
+prefill hold was injected only into the two experiment worktrees because the
+public CLI does not expose that scheduler option for Qwen3-TTS. It is not part
+of the measured implementation or any pushed branch. This protocol is for
+correctness only; its added wait and deterministic vocoder are excluded from
+the performance table.
 
 The benchmark client is `benchmarks/eval/benchmark_qwen3_tts_kda.py`.
 
@@ -103,11 +151,12 @@ configuration.
 | Short C4 | 1.126911 s | 1.119735 s | -0.6% |
 | Short C8 | 1.352928 s | 1.368371 s | +1.1% |
 
-C4 passes the exact-output gate at 40/40. C8 matches 75/80 WAV hashes; five WAVs
-contain one of two hashes not present in the available main reference set. This
-is a correctness-gate failure for the isolation arm. It does not change the
-standard sync result above, but it prevents a C8 parity claim for this isolation.
-It also prevents using the C8 isolation as definitive performance attribution.
+C4 matches the available main set at 40/40. C8 matches 75/80 WAV hashes; five
+WAVs contain one of two hashes not present in that finite set. The synchronous
+Predictor PR reproduces the same five-WAV pattern, and the main-equivalent audit
+shows that the finite set can reject unchanged serving code. This result does
+not implicate async, and it cannot provide definitive C8 performance
+attribution. The fixed-layout check above supplies the separate parity result.
 
 ## Latest sync vs async profile
 
