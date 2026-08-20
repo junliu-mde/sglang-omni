@@ -4,8 +4,8 @@ This script is deliberately small.  It sends a fixed voice-cloning request to
 the public HTTP API, records end-to-end wall time and response metadata, and
 checks C1 audio byte identity. Cn uses ``/v1/audio/speech/batch`` so all items
 enter the server in one arrival group. The endpoint does not promise a fixed
-scheduler batch layout. Cn correctness therefore compares each exact, sorted
-WAV SHA-256 multiset against signatures observed in main reference reports.
+scheduler batch layout. Cn correctness therefore requires every exact WAV
+SHA-256 to appear in a main reference report, without pairing runs or layouts.
 
 Example::
 
@@ -60,7 +60,7 @@ def _parse_args() -> argparse.Namespace:
         default=[],
         type=Path,
         help=(
-            "Main report whose exact controlled-Cn WAV signatures are accepted. "
+            "Main report whose exact controlled-Cn WAV hashes are accepted. "
             "May be specified more than once."
         ),
     )
@@ -257,6 +257,10 @@ def _controlled_signatures(
     ]
 
 
+def _controlled_hashes(runs: list[dict[str, Any]]) -> list[str]:
+    return [item["sha256"] for result in runs for item in result["items"]]
+
+
 def _signature_counts(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     counts: dict[tuple[str, ...], int] = {}
     for signature in _controlled_signatures(runs):
@@ -299,8 +303,8 @@ def _reference_config(report: dict[str, Any]) -> dict[str, Any]:
 
 def _load_correctness_references(
     paths: list[Path], expected_config: dict[str, Any]
-) -> tuple[set[tuple[str, ...]], list[dict[str, Any]]]:
-    accepted: set[tuple[str, ...]] = set()
+) -> tuple[set[str], list[dict[str, Any]]]:
+    accepted: set[str] = set()
     metadata: list[dict[str, Any]] = []
     for path in paths:
         try:
@@ -313,14 +317,14 @@ def _load_correctness_references(
                     "correctness reference config does not match this run"
                 )
             runs = report["controlled_concurrency"]["runs"]
-            signatures = set(_controlled_signatures(runs))
+            hashes = set(_controlled_hashes(runs))
         except (OSError, TypeError, KeyError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"cannot load correctness reference {path}") from exc
-        accepted.update(signatures)
+        accepted.update(hashes)
         metadata.append(
             {
                 "report_sha256": hashlib.sha256(contents).hexdigest(),
-                "signature_count": len(signatures),
+                "hash_count": len(hashes),
             }
         )
     return accepted, metadata
@@ -328,26 +332,28 @@ def _load_correctness_references(
 
 def _controlled_correctness(
     runs: list[dict[str, Any]],
-    accepted: set[tuple[str, ...]],
+    accepted: set[str],
     references: list[dict[str, Any]],
 ) -> dict[str, Any]:
     if not references:
         return {
             "status": "not_evaluated",
-            "method": "exact_sorted_wav_sha256_multiset",
+            "method": "exact_wav_sha256_membership",
             "reference_reports": [],
-            "matched_runs": 0,
-            "unmatched_signatures": [],
+            "matched_items": 0,
+            "total_items": sum(len(result["items"]) for result in runs),
+            "unmatched_hashes": [],
         }
 
-    signatures = _controlled_signatures(runs)
-    unmatched = sorted(set(signatures) - accepted)
+    hashes = _controlled_hashes(runs)
+    unmatched = sorted(set(hashes) - accepted)
     return {
         "status": "pass" if not unmatched else "fail",
-        "method": "exact_sorted_wav_sha256_multiset",
+        "method": "exact_wav_sha256_membership",
         "reference_reports": references,
-        "matched_runs": sum(signature in accepted for signature in signatures),
-        "unmatched_signatures": [list(signature) for signature in unmatched],
+        "matched_items": sum(sha256 in accepted for sha256 in hashes),
+        "total_items": len(hashes),
+        "unmatched_hashes": unmatched,
     }
 
 
@@ -399,8 +405,8 @@ def main() -> None:
             "concurrency": args.concurrency,
             "correctness_note": (
                 "The batch endpoint controls arrival grouping, not the internal "
-                "scheduler layout. Correctness uses exact sorted WAV SHA-256 "
-                "multisets accepted by main reference reports."
+                "scheduler layout. Every exact WAV SHA-256 must appear in a "
+                "main reference report; runs and layouts are not paired."
             ),
             "signatures": _signature_counts(controlled),
             "runs": [

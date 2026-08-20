@@ -123,34 +123,36 @@ def test_controlled_signatures_ignore_response_item_order() -> None:
     ]
 
 
-def test_controlled_correctness_accepts_any_exact_main_signature() -> None:
+def test_controlled_correctness_accepts_new_layout_of_exact_main_hashes() -> None:
     runs = [
         _controlled_run("hash-b", "hash-a"),
-        _controlled_run("hash-c", "hash-c"),
+        _controlled_run("hash-a", "hash-a"),
     ]
-    accepted = {("hash-a", "hash-b"), ("hash-c", "hash-c")}
+    accepted = {"hash-a", "hash-b"}
 
     result = _controlled_correctness(
         runs,
         accepted,
-        [{"report_sha256": "main", "signature_count": 2}],
+        [{"report_sha256": "main", "hash_count": 2}],
     )
 
     assert result["status"] == "pass"
-    assert result["matched_runs"] == 2
-    assert result["unmatched_signatures"] == []
+    assert result["matched_items"] == 4
+    assert result["total_items"] == 4
+    assert result["unmatched_hashes"] == []
 
 
-def test_controlled_correctness_rejects_unseen_exact_signature() -> None:
+def test_controlled_correctness_rejects_unseen_exact_wav_hash() -> None:
     result = _controlled_correctness(
         [_controlled_run("changed", "hash-a")],
-        {("hash-a", "hash-b")},
-        [{"report_sha256": "main", "signature_count": 1}],
+        {"hash-a", "hash-b"},
+        [{"report_sha256": "main", "hash_count": 2}],
     )
 
     assert result["status"] == "fail"
-    assert result["matched_runs"] == 0
-    assert result["unmatched_signatures"] == [["changed", "hash-a"]]
+    assert result["matched_items"] == 1
+    assert result["total_items"] == 2
+    assert result["unmatched_hashes"] == ["changed"]
 
 
 def test_controlled_correctness_is_explicit_without_references() -> None:
@@ -167,7 +169,7 @@ def _reference_report(config: dict, *hashes: str) -> dict:
     }
 
 
-def test_correctness_references_combine_exact_signatures(tmp_path: Path) -> None:
+def test_correctness_references_combine_exact_wav_hashes(tmp_path: Path) -> None:
     config = {
         "model": "model",
         "input": "input",
@@ -186,8 +188,8 @@ def test_correctness_references_combine_exact_signatures(tmp_path: Path) -> None
         [before, after], expected_config=config
     )
 
-    assert accepted == {("hash-a", "hash-b"), ("hash-c", "hash-c")}
-    assert [entry["signature_count"] for entry in metadata] == [1, 1]
+    assert accepted == {"hash-a", "hash-b", "hash-c"}
+    assert [entry["hash_count"] for entry in metadata] == [2, 1]
     assert all("report_sha256" in entry for entry in metadata)
 
 
