@@ -280,13 +280,12 @@ class Qwen3TTSModelRunner(ModelRunner):
             if getattr(req, _LOOKAHEAD_REPETITION_SYNC_FALLBACK_ATTR, False):
                 delattr(req, _LOOKAHEAD_REPETITION_SYNC_FALLBACK_ATTR)
 
-    def _apply_repetition_penalty(self, logits_output: Any, requests: list) -> None:
-        """Apply Qwen's host-history penalty plus a lookahead-only device id."""
-
-        super()._apply_repetition_penalty(logits_output, requests)
-        logits = logits_output.next_token_logits
-        if logits is None or logits.ndim != 2:
-            return
+    def _apply_lookahead_repetition_token(
+        self,
+        logits: torch.Tensor,
+        requests: list,
+    ) -> None:
+        """Apply the one semantic ID absent from host output history."""
 
         rows: list[int] = []
         token_ids: list[int] = []
@@ -462,7 +461,7 @@ class Qwen3TTSModelRunner(ModelRunner):
                 seen = ModelRunner._rep_penalty_unique_tokens(data, output_ids, vocab)
                 rep_rows.extend([row_idx] * len(seen))
                 rep_toks.extend(seen)
-            suppress_tokens = data.suppress_tokens
+            suppress_tokens = getattr(data, "suppress_tokens", None)
             if not suppress_tokens:
                 suppress_tokens = getattr(req, "_codec_suppress_tokens", None)
             if suppress_tokens:
@@ -523,6 +522,7 @@ class Qwen3TTSModelRunner(ModelRunner):
             logits.copy_(
                 torch.where(rep_mask[:batch_size], penalized, scores).to(logits.dtype)
             )
+        self._apply_lookahead_repetition_token(logits, requests)
 
     def _apply_codec_suppress_tokens(self, logits_output: Any, requests: list) -> None:
         logits = logits_output.next_token_logits
@@ -683,6 +683,7 @@ class Qwen3TTSModelRunner(ModelRunner):
                 code_chunk = code_chunk.detach().clone()
                 feedback = feedback.detach().clone()
             sched_req.data.output_codes.append(code_chunk)
+            sched_req.data.latest_stream_code_chunk = code_chunk
             if not feedback_prepublished:
                 sched_req.data.pending_feedback_queue.append(feedback)
 

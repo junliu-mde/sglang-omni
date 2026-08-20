@@ -2160,6 +2160,11 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
 ) -> None:
     """Initial and late runners receive the same execution bridge contract."""
     monkeypatch.setattr(
+        omni_scheduler_module,
+        "_set_default_pp_max_micro_batch_size",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
         OmniScheduler,
         "_init_parallel_state",
         lambda self, _tp_worker: setattr(self, "ps", SimpleNamespace(pp_size=1)),
@@ -2544,6 +2549,7 @@ def test_omni_scheduler_prepares_custom_request_token_budget() -> None:
     scheduler.max_new_tokens_limit = None
     scheduler.page_size = 1
     scheduler.max_total_num_tokens = 128
+    scheduler.server_args = SimpleNamespace(dcp_size=1)
     _init_sync_request_build_state(scheduler)
 
     sampling_params = SimpleNamespace(max_new_tokens=10, min_new_tokens=0)
@@ -2582,6 +2588,7 @@ def test_omni_scheduler_rejects_custom_request_over_context() -> None:
     scheduler.max_new_tokens_limit = None
     scheduler.page_size = 1
     scheduler.max_total_num_tokens = 128
+    scheduler.server_args = SimpleNamespace(dcp_size=1)
     scheduler.running_batch = SimpleNamespace(reqs=[], batch_is_full=False)
     scheduler.cur_batch = None
     scheduler.last_batch = None
@@ -2645,7 +2652,7 @@ def test_omni_scheduler_follower_rejections_do_not_emit_errors() -> None:
     scheduler.max_new_tokens_limit = None
     scheduler.page_size = 1
     scheduler.max_total_num_tokens = 128
-    scheduler.server_args = SimpleNamespace(mem_fraction_static=0.85)
+    scheduler.server_args = SimpleNamespace(dcp_size=1, mem_fraction_static=0.85)
     _init_sync_request_build_state(scheduler)
 
     over_context_req = SimpleNamespace(

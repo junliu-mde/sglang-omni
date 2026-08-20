@@ -91,7 +91,13 @@ def _set_default_pp_max_micro_batch_size(
             get_context().override(source, pp_max_micro_batch_size=value)
         return
 
-    server_args = get_server_args()
+    try:
+        server_args = get_server_args()
+    except ValueError:
+        # Unit construction and scheduler-owned runners can precede SGLang's
+        # global runtime-context initialization. There is no global field to
+        # update in that state.
+        return
     if server_args.pp_max_micro_batch_size is None:
         server_args.override(source, pp_max_micro_batch_size=value)
 
