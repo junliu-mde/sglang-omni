@@ -16,6 +16,11 @@ The fixed tree passes controlled C4 `4/4`, forced-lookahead C1 `4/4`, modified
 tests `6/6`, and the focused suite `335/335`. The unfixed revision fails the
 same controlled C4 protocol `0/2`, so the gate discriminates the fix.
 
+P4 has no viable Predictor GEMM or launch-reduction candidate under the exact
+output contract. The best candidate, MLP down projection plus residual through
+`addmm`, failed real-shape BF16 identity at B=1/4/8. Its source changes were
+restored. No Predictor code was committed.
+
 ## Async root cause
 
 An experiment-only output hook aligned the host-resolved semantic ID, all 16
@@ -154,3 +159,64 @@ after parity repair is host-side graph-node or submit-cost reduction that does
 not change FLOP order.
 
 Full profile evidence is `runs/profile_summary_0821c.md`.
+
+## P4 no-viable-candidate verdict
+
+The P3 median leaves `10.293642 - 5.545372 = 4.748270 ms` of wall time outside
+GPU-busy intervals. The ratio of the rounded medians is
+`5.545372 / 10.293642 = 53.9%`. A GPU-only saving smaller than 4.748270 ms can be
+fully hidden by the host path. For a candidate GPU saving `G`, P3 therefore
+supports only a wall-saving range of zero to `G`; service measurement would be
+required after identity and isolated timing pass.
+
+The Predictor trace gives these direct kernel opportunities:
+
+| Family | Eligible launch estimate | Separate GPU work | Identity decision |
+| --- | ---: | ---: | --- |
+| QKV split-K reduction | 80 | 0.132398 ms | Ineligible: a different split-K reduction changes BF16 reduction order. |
+| Gate/up plus SiLU-and-multiply | 80 | 0.103714 ms | Ineligible: fusion changes the GEMM kernel and reimplements SiLU. |
+| Attention output plus residual | 0 | 0 ms | Already uses the retained `addmm` path. |
+| MLP down plus residual | 80 | 0.086451 ms | Tested and rejected at the exact-output gate. |
+| Input projection plus bias | 0 | 0 ms | Bias is already in the GEMM launch. |
+| LM head plus sampling | 15 | 0.290951 ms | Ineligible: groups are sequential and fusion requires a new GEMM epilogue or sampling implementation. |
+| Grouped Predictor GEMMs | 0 | 0 ms | Ineligible: layer and code-group dependencies leave no independent calls to group. |
+
+The 80-node MLP candidate would reduce total step launches from 1,672 to 1,592,
+or `80 / 1,672 = 4.784689%`. It would reduce Predictor graph nodes from 1,255
+to 1,175, or `6.374502%`. The separate add kernels cost 0.086451417 ms per step,
+which is an upper bound because the fused beta term must still read and add the
+residual. An occupancy-weighted planning value is
+`0.086451417 * 0.538718 = 0.046572949 ms`, or 0.452444% of wall. A linear graph
+node scale gives `2.1337785 * 80 / 1,255 = 0.136018 ms` of Predictor submit CPU
+time, but CUDA graph submit cost is not guaranteed to scale linearly.
+
+The candidate reused the retained H100 graph-capture contract: unquantized TP=1,
+BF16 contiguous tensors, the same operands and weight view, and in-place reuse
+of residual storage that the caller immediately replaces. A temporary directed
+test tree passed `53/53`, including exact sampled codec IDs and summed embeddings
+at B=1/4/8. The real checkpoint shape then failed the first ordered gate:
+
+| Batch | Exact fixed trials | Mismatched elements | Maximum absolute delta |
+| ---: | ---: | ---: | ---: |
+| 1 | 0/32 | 8,557 | 0.03125 |
+| 4 | 0/32 | 34,422 | 0.03125 |
+| 8 | 0/32 | 68,645 | 0.03125 |
+
+The comparison used the BF16 `[1024, 3072]` checkpoint weight in one process.
+The reference materializes the BF16 GEMM result before the separate residual
+add. The `addmm` beta epilogue does not preserve that rounding boundary for this
+shape. Preserving the matrix reduction order alone is therefore insufficient.
+
+The gate order stops on this identity failure. The isolated CUDA-graph
+microbenchmark and fixed-seed C1/C4 service A/B were not run. Timing cannot
+override an exact-output failure. All other families lack a sound identity
+argument, so the final P4 verdict is no viable candidate.
+
+Evidence:
+
+- `runs/p4_down_addmm_gate_0821e.json`
+- `runs/p4_down_addmm_gate_0821e.log`
+- `runs/p4_gate1_predictor_tests_0821e.log`
+- `docs/draft.md`
+- `docs/plan.md`
+- `candidates.jsonl`
