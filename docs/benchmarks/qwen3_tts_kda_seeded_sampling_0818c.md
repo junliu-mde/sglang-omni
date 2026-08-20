@@ -18,7 +18,7 @@ seeded sampling 链合成一个 Triton kernel。该 kernel 从 BF16 logits 直�
   `(seed, position)` 生成的 Gumbel sample。
 - **R**：`_sample_subtalker_token_seeded()` 中的 `float → temperature → topk →
   top-k mask → softmax → top-p mask → log → seeded sample` 链。
-- **W**：HPC3 的 1x H100 80 GB。BF16 logits。batch 为 1、4、8。每次 decode 有
+- **W**：1x H100 80 GB。BF16 logits。batch 为 1、4、8。每次 decode 有
   15 个 Predictor codec group。
 - **不变量**：在同一进程中，相同 logits、参数、seed 和 position 必须产生完全相同
   的 codec ID。
@@ -81,29 +81,16 @@ kernel 数减少 330，或 84.6%。其中每 group 的 1 个融合 kernel 替代
 这是 isolated sampling 段的 GPU 结果。它不等同于端到端延迟结论。run 0817a 的
 主要瓶颈仍是逐步主机读回和调度重叠。
 
-## 可复查证据
+## 可复查步骤
 
-Pod：`<internal-pod>`。节点：`<internal-node>`。GPU：H100 80 GB。
-镜像：`lmsysorg/sglang@sha256:16aba8925507e631e1dc1e23d95d026533602591775f6a8db68b74ee99746155`。
-
-原始数据位于：
-
-`<internal-evidence-path>`
-
-主要文件：
-
-- `seeded_sampling_review_followup_v1.json`
-- `seeded_sampling_15_group_alternating_benchmark_v3.json`
-- `seeded_sampling_reference_trace_v6.nsys-rep`
-- `seeded_sampling_fused_trace_v6.nsys-rep`
-- `seeded_sampling_reference_trace_v6_kern_sum_cuda_gpu_kern_sum.csv`
-- `seeded_sampling_fused_trace_v6_kern_sum_cuda_gpu_kern_sum.csv`
+本报告不包含内部服务器标识或原始 profile 文件。仓库内的测试和下方命令
+覆盖固定 seed 的正确性以及候选的选择条件。
 
 H100 验证命令：
 
 ```bash
 FLASHINFER_DISABLE_VERSION_CHECK=1 PYTHONWARNINGS=ignore \
-PYTHONPATH=/workspace/sglang-omni \
+PYTHONPATH=. \
 python -m pytest -q \
   tests/unit_test/qwen3_tts/test_sampling_kernels.py \
   tests/unit_test/qwen3_tts/test_predictor_cuda_graph.py

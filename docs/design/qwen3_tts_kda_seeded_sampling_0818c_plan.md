@@ -21,7 +21,7 @@ argmax 继续使用当前参考路径。
   `float → temperature → torch.topk → top-k mask → softmax → top-p mask →
   log → sample_from_sorted_logprobs_with_seed_small_k()`。
 - **W（工作负载）**：`Qwen/Qwen3-TTS-12Hz-1.7B-Base` Predictor 的采样几何：
-  词表 2048、每个语义 token 15 个 codec group。HPC3 单张 H100 80 GB，BF16 logits，
+  词表 2048、每个语义 token 15 个 codec group。单张 H100 80 GB，BF16 logits，
   batch 1、4、8，top-k 30、50，top-p 1.0、0.8、0.95。该 isolated 测量不加载
   checkpoint，也不报告端到端延迟。
 - **不变量**：相同输入、seed、语义位置和 group 时，候选必须产生与 R
@@ -110,5 +110,5 @@ argmax 继续使用当前参考路径。
 
 ## Implementation Notes
 
-代码和注释不使用本计划中的 AC、阶段或任务编号。`kda_runs/` 只保存到 PVC，
-不得加入 Git。
+代码和注释不使用本计划中的 AC、阶段或任务编号。原始 benchmark 文件不提交，
+也不作为测试输入。

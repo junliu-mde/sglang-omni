@@ -22,8 +22,7 @@ pageable 报告复制。但是 C1 的端到端收益不超过测量噪声。因�
 
 - 模型：`Qwen/Qwen3-TTS-12Hz-1.7B-Base`。
 - 负载：固定 seed 的英文 ICL 声音克隆。输出为 24 kHz WAV。
-- 硬件：HPC3 的 1x H100 80 GB，GPU UUID
-  `<gpu-uuid>`，driver `590.48.01`。
+- 硬件：1x NVIDIA H100 80 GB，driver `590.48.01`。
 - 镜像：`lmsysorg/sglang@sha256:16aba8925507e631e1dc1e23d95d026533602591775f6a8db68b74ee99746155`。
 - 运行时：SGLang 0.5.16、Torch 2.11.0+cu130、Transformers 5.12.1、
   qwen-tts 0.1.1。

@@ -106,18 +106,13 @@ C4 的 batch endpoint 不能保证相同的内部 scheduler layout。部分 C4 �
 `engine-time` 来自服务响应头，不包括客户端到该端口的连接成本。为避免把 scheduler
 layout 差异解释为性能，C4 数字不用于此结论。
 
-## 环境和证据
+## 运行环境
 
-- Pod：`<internal-pod>`。
-- Kubernetes context：`<internal-cluster>`。节点：`<internal-node>`。
 - GPU：NVIDIA H100 80 GB，driver `590.48.01`。
-- 源提交：`22faf0a7fb8a25e32d99006aff0c3ed3065aabe4`。
 - 运行时：SGLang `0.5.17`、Torch `2.11.0+cu130`、Transformers `5.12.1`、
   qwen-tts `0.1.1`。
-- 原始 JSON、服务日志、event JSONL 和 trace 位于：
-  `<internal-evidence-path>`。
-- 关键 trace：`trace/unstaged_tts_trace/tts_engine/trace_pid10006_rank0.trace.json.gz`
-  和 `trace/staged_tts_trace/tts_engine/trace_pid10986_rank0.trace.json.gz`。
+
+本报告不包含内部服务器标识、服务日志或原始 trace 文件。
 
 CUDA Docs MCP 已对 `cudaMemcpyAsync`、pinned host memory、event 和 stream wait
 语义发起查询。该服务返回 HTTP 500，因此本报告不把 MCP 响应作为证据。结论只基于

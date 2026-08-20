@@ -28,7 +28,7 @@ codec ID。因此 KDA 在性能测量前拒绝了 P1。
 - **R（参考实现）**：提交
   `9da7d19123ac5272dab005082d28f11c89452d40` 中的
   `nn.Embedding(next_code)`，随后执行 `pos_summed.add_()`。
-- **W（工作负载）**：`Qwen/Qwen3-TTS-12Hz-1.7B-Base`，HPC3 单张 H100
+- **W（工作负载）**：`Qwen/Qwen3-TTS-12Hz-1.7B-Base`，单张 H100
   80 GB，BF16，batch 为 1、4、8。生产验证使用同进程的固定 seed ICL
   声音克隆请求。
 - **不变量**：不得使用 `torch.compile` 或 Inductor；不得改变权重、精度、
@@ -88,20 +88,10 @@ P3 使用 B=4、hidden=1024、16 groups 和小词表 fixture 进行结构性测�
 未读取 buffer 的写入节点。该 fixture 不是完整 1.7B Predictor，不能将该
 数值外推为完整模型收益。
 
-## 可复查证据
+## 可复查步骤
 
-Pod：`<internal-pod>`。节点：`<internal-node>`。GPU：
-H100 80 GB。driver：`590.48.01`。原始证据保存在 PVC：
-
-`<internal-evidence-path>`
-
-主要文件：
-
-- `candidates.jsonl`：P1 的拒绝记录。
-- `p2_gather_add_v2.json`：P2 CUDA-event 测量。
-- `p2_profile_v2/summary.json`：P2 kernel 数和 GPU 时间。
-- `p3_staging_v4.json`：P3 结构性测量。
-- `p2_p3_same_process_parity.json`：同一进程的生产路径对照。
+本报告不包含内部服务器标识或原始性能文件。下面的测试命令和仓库内测试
+提供可复查的正确性检查。
 
 H100 定向验证命令如下：
 

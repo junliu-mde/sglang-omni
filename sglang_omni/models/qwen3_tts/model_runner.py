@@ -666,9 +666,6 @@ class Qwen3TTSModelRunner(ModelRunner):
         eos_id = int(self.model.config.codec_eos_token_id)
         # Note: (Jiaxin Deng) per-row clones were a c32 decode-loop hot spot;
         # rows must stay views of a snapshot, never of the reused graph buffers.
-        batch_size = len(scheduler_output.requests)
-        codes_snap = self.model._output_codes[:batch_size].detach().clone()
-        embeds_snap = self.model._output_embeds[:batch_size].detach().clone()
         for row_idx, sched_req in enumerate(scheduler_output.requests):
             req_output = outputs[sched_req.request_id]
             code_chunk = code_snapshot[row_idx]
