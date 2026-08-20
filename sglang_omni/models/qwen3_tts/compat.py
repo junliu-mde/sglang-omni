@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-from functools import wraps
 import inspect
 import threading
+from functools import wraps
 from typing import Any, Callable
 
 import torch
@@ -55,9 +55,7 @@ def _make_mask_factory_compat(
     def mask_factory_compat(*args: Any, **kwargs: Any) -> Any:
         if "input_embeds" in kwargs:
             if "inputs_embeds" in kwargs:
-                raise TypeError(
-                    f"{name} received both input_embeds and inputs_embeds"
-                )
+                raise TypeError(f"{name} received both input_embeds and inputs_embeds")
             kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
         if not accepts_cache_position:
             kwargs.pop("cache_position", None)
