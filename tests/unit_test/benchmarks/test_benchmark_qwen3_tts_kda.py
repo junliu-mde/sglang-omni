@@ -22,6 +22,9 @@ _MODULE = runpy.run_path(str(_SCRIPT))
 _parse_args = _MODULE["_parse_args"]
 _request_payload = _MODULE["_request_payload"]
 _batch_result = _MODULE["_batch_result"]
+_controlled_correctness = _MODULE["_controlled_correctness"]
+_controlled_signatures = _MODULE["_controlled_signatures"]
+_load_correctness_references = _MODULE["_load_correctness_references"]
 
 
 def _args(repetition_penalty: float | None) -> argparse.Namespace:
@@ -64,6 +67,31 @@ def test_parse_args_rejects_nonpositive_repetition_penalty(monkeypatch) -> None:
         _parse_args()
 
 
+def test_parse_args_rejects_nonpositive_concurrency(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark_qwen3_tts_kda.py",
+            "--reference-audio",
+            "file:///reference.wav",
+            "--reference-text",
+            "reference transcript",
+            "--input",
+            "benchmark text",
+            "--seed",
+            "1",
+            "--output",
+            "report.json",
+            "--concurrency",
+            "0",
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_args()
+
+
 def test_batch_result_rejects_missing_items() -> None:
     body = json.dumps(
         {
@@ -79,3 +107,104 @@ def test_batch_result_rejects_missing_items() -> None:
 
     with pytest.raises(RuntimeError, match="unexpected number of items"):
         _batch_result(body, wall_s=1.0, expected_item_count=4)
+
+
+def _controlled_run(*hashes: str) -> dict:
+    return {
+        "items": [
+            {"index": index, "sha256": sha256} for index, sha256 in enumerate(hashes)
+        ]
+    }
+
+
+def test_controlled_signatures_ignore_response_item_order() -> None:
+    assert _controlled_signatures([_controlled_run("hash-b", "hash-a")]) == [
+        ("hash-a", "hash-b")
+    ]
+
+
+def test_controlled_correctness_accepts_any_exact_main_signature() -> None:
+    runs = [
+        _controlled_run("hash-b", "hash-a"),
+        _controlled_run("hash-c", "hash-c"),
+    ]
+    accepted = {("hash-a", "hash-b"), ("hash-c", "hash-c")}
+
+    result = _controlled_correctness(
+        runs,
+        accepted,
+        [{"report_sha256": "main", "signature_count": 2}],
+    )
+
+    assert result["status"] == "pass"
+    assert result["matched_runs"] == 2
+    assert result["unmatched_signatures"] == []
+
+
+def test_controlled_correctness_rejects_unseen_exact_signature() -> None:
+    result = _controlled_correctness(
+        [_controlled_run("changed", "hash-a")],
+        {("hash-a", "hash-b")},
+        [{"report_sha256": "main", "signature_count": 1}],
+    )
+
+    assert result["status"] == "fail"
+    assert result["matched_runs"] == 0
+    assert result["unmatched_signatures"] == [["changed", "hash-a"]]
+
+
+def test_controlled_correctness_is_explicit_without_references() -> None:
+    result = _controlled_correctness([_controlled_run("hash-a", "hash-b")], set(), [])
+
+    assert result["status"] == "not_evaluated"
+
+
+def _reference_report(config: dict, *hashes: str) -> dict:
+    return {
+        "schema_version": 3,
+        "config": config,
+        "controlled_concurrency": {"runs": [_controlled_run(*hashes)]},
+    }
+
+
+def test_correctness_references_combine_exact_signatures(tmp_path: Path) -> None:
+    config = {
+        "model": "model",
+        "input": "input",
+        "reference_audio": "file:///reference.wav",
+        "reference_text": "reference transcript",
+        "seed": 20260819,
+        "repetition_penalty": 1.05,
+        "concurrency": 4,
+    }
+    before = tmp_path / "before.json"
+    after = tmp_path / "after.json"
+    before.write_text(json.dumps(_reference_report(config, "hash-a", "hash-b")))
+    after.write_text(json.dumps(_reference_report(config, "hash-c", "hash-c")))
+
+    accepted, metadata = _load_correctness_references(
+        [before, after], expected_config=config
+    )
+
+    assert accepted == {("hash-a", "hash-b"), ("hash-c", "hash-c")}
+    assert [entry["signature_count"] for entry in metadata] == [1, 1]
+    assert all("report_sha256" in entry for entry in metadata)
+
+
+def test_correctness_reference_rejects_config_mismatch(tmp_path: Path) -> None:
+    config = {
+        "model": "model",
+        "input": "input",
+        "reference_audio": "file:///reference.wav",
+        "reference_text": "reference transcript",
+        "seed": 20260819,
+        "repetition_penalty": 1.05,
+        "concurrency": 4,
+    }
+    reference = tmp_path / "reference.json"
+    reference.write_text(
+        json.dumps(_reference_report(dict(config, concurrency=8), "hash"))
+    )
+
+    with pytest.raises(RuntimeError, match="config does not match"):
+        _load_correctness_references([reference], expected_config=config)

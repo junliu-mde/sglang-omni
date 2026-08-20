@@ -1,11 +1,11 @@
-"""Measure seeded Qwen3-TTS behavior for a fixed C1 and controlled C4 workload.
+"""Measure seeded Qwen3-TTS behavior for C1 and controlled Cn workloads.
 
 This script is deliberately small.  It sends a fixed voice-cloning request to
 the public HTTP API, records end-to-end wall time and response metadata, and
-checks C1 audio byte identity.  C4 uses ``/v1/audio/speech/batch`` so all four
-items enter the server in one arrival group.  The endpoint does not promise a
-fixed scheduler batch layout, so the script records each observed C4 layout but
-does not incorrectly fail a valid run when those layouts differ.
+checks C1 audio byte identity. Cn uses ``/v1/audio/speech/batch`` so all items
+enter the server in one arrival group. The endpoint does not promise a fixed
+scheduler batch layout. Cn correctness therefore compares each exact, sorted
+WAV SHA-256 multiset against signatures observed in main reference reports.
 
 Example::
 
@@ -15,6 +15,9 @@ Example::
         --reference-text "Reference transcript." \
         --input "Text to synthesize." \
         --seed 20260819 \
+        --concurrency 8 \
+        --correctness-reference /tmp/main-before.json \
+        --correctness-reference /tmp/main-after.json \
         --output /tmp/qwen3-tts.json
 """
 
@@ -37,9 +40,7 @@ DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Measure fixed-seed Qwen3-TTS C1 and controlled C4 HTTP behavior."
-        )
+        description=("Measure fixed-seed Qwen3-TTS C1 and controlled Cn HTTP behavior.")
     )
     parser.add_argument("--base-url", default="http://127.0.0.1:18000")
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -52,15 +53,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--audio-dir", type=Path)
     parser.add_argument("--repetitions", default=5, type=int)
     parser.add_argument("--warmup", default=1, type=int)
-    parser.add_argument("--batch-size", default=4, type=int)
+    parser.add_argument("--concurrency", default=4, type=int)
+    parser.add_argument(
+        "--correctness-reference",
+        action="append",
+        default=[],
+        type=Path,
+        help=(
+            "Main report whose exact controlled-Cn WAV signatures are accepted. "
+            "May be specified more than once."
+        ),
+    )
     parser.add_argument("--timeout-s", default=180.0, type=float)
     args = parser.parse_args()
     if args.repetitions <= 0:
         parser.error("--repetitions must be positive")
     if args.warmup < 0:
         parser.error("--warmup must be non-negative")
-    if args.batch_size <= 0:
-        parser.error("--batch-size must be positive")
+    if args.concurrency <= 0:
+        parser.error("--concurrency must be positive")
     if args.timeout_s <= 0:
         parser.error("--timeout-s must be positive")
     if args.repetition_penalty is not None and args.repetition_penalty <= 0:
@@ -99,7 +110,9 @@ def _post(
     try:
         with urllib.request.urlopen(request, timeout=timeout_s) as response:
             body = response.read()
-            headers = {str(key).lower(): str(value) for key, value in response.headers.items()}
+            headers = {
+                str(key).lower(): str(value) for key, value in response.headers.items()
+            }
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(
@@ -108,7 +121,9 @@ def _post(
     return body, headers, time.perf_counter() - started
 
 
-def _audio_result(audio: bytes, wall_s: float, headers: dict[str, str]) -> dict[str, Any]:
+def _audio_result(
+    audio: bytes, wall_s: float, headers: dict[str, str]
+) -> dict[str, Any]:
     def numeric_header(name: str) -> float | int | None:
         value = headers.get(name)
         if value is None:
@@ -146,7 +161,9 @@ def _batch_result(
             audio = base64.b64decode(item["audio_data"], validate=True)
             index = int(item["index"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError("successful speech batch item has an invalid schema") from exc
+            raise RuntimeError(
+                "successful speech batch item has an invalid schema"
+            ) from exc
         items.append(
             {
                 "index": index,
@@ -166,7 +183,10 @@ def _batch_result(
     return {
         "wall_s": wall_s,
         "item_count": len(items),
-        "items": [{key: value for key, value in item.items() if key != "audio"} for item in items],
+        "items": [
+            {key: value for key, value in item.items() if key != "audio"}
+            for item in items
+        ],
         "audio": [item["audio"] for item in items],
     }
 
@@ -188,7 +208,9 @@ def _write_audio(path: Path, name: str, audio: bytes) -> None:
     (path / name).write_bytes(audio)
 
 
-def _run_c1(args: argparse.Namespace, payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[bytes]]:
+def _run_c1(
+    args: argparse.Namespace, payload: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[bytes]]:
     endpoint = f"{args.base_url.rstrip('/')}/v1/audio/speech"
     results: list[dict[str, Any]] = []
     audio_outputs: list[bytes] = []
@@ -198,16 +220,20 @@ def _run_c1(args: argparse.Namespace, payload: dict[str, Any]) -> tuple[list[dic
         audio, headers, wall_s = _post(
             endpoint, dict(payload, input=args.input_text), args.timeout_s
         )
-        results.append({"iteration": iteration, **_audio_result(audio, wall_s, headers)})
+        results.append(
+            {"iteration": iteration, **_audio_result(audio, wall_s, headers)}
+        )
         audio_outputs.append(audio)
     return results, audio_outputs
 
 
-def _run_c4(args: argparse.Namespace, payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _run_controlled(
+    args: argparse.Namespace, payload: dict[str, Any]
+) -> list[dict[str, Any]]:
     endpoint = f"{args.base_url.rstrip('/')}/v1/audio/speech/batch"
     batch_payload = dict(
         payload,
-        items=[{"input": args.input_text} for _ in range(args.batch_size)],
+        items=[{"input": args.input_text} for _ in range(args.concurrency)],
     )
     results: list[dict[str, Any]] = []
     for _ in range(args.warmup):
@@ -217,89 +243,186 @@ def _run_c4(args: argparse.Namespace, payload: dict[str, Any]) -> list[dict[str,
         results.append(
             {
                 "iteration": iteration,
-                **_batch_result(body, wall_s, args.batch_size),
+                **_batch_result(body, wall_s, args.concurrency),
             }
         )
     return results
 
 
-def _c4_layouts(c4: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    counts: dict[tuple[str, ...], int] = {}
-    for result in c4:
-        layout = tuple(item["sha256"] for item in result["items"])
-        counts[layout] = counts.get(layout, 0) + 1
+def _controlled_signatures(
+    runs: list[dict[str, Any]],
+) -> list[tuple[str, ...]]:
     return [
-        {"hashes": list(layout), "runs": count}
-        for layout, count in sorted(
+        tuple(sorted(item["sha256"] for item in result["items"])) for result in runs
+    ]
+
+
+def _signature_counts(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    counts: dict[tuple[str, ...], int] = {}
+    for signature in _controlled_signatures(runs):
+        counts[signature] = counts.get(signature, 0) + 1
+    return [
+        {"hashes": list(signature), "runs": count}
+        for signature, count in sorted(
             counts.items(), key=lambda entry: (-entry[1], entry[0])
         )
     ]
 
 
-def _determinism(c1: list[dict[str, Any]]) -> dict[str, bool]:
+def _c1_correctness(c1: list[dict[str, Any]]) -> dict[str, Any]:
     c1_hashes = {result["sha256"] for result in c1}
     return {
-        "c1_byte_identical": len(c1_hashes) == 1,
+        "status": "pass" if len(c1_hashes) == 1 else "fail",
+        "byte_identical": len(c1_hashes) == 1,
+        "sha256": sorted(c1_hashes),
+    }
+
+
+_REFERENCE_CONFIG_KEYS = (
+    "model",
+    "input",
+    "reference_audio",
+    "reference_text",
+    "seed",
+    "repetition_penalty",
+    "concurrency",
+)
+
+
+def _reference_config(report: dict[str, Any]) -> dict[str, Any]:
+    try:
+        config = report["config"]
+        return {key: config[key] for key in _REFERENCE_CONFIG_KEYS}
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError("correctness reference has an invalid config") from exc
+
+
+def _load_correctness_references(
+    paths: list[Path], expected_config: dict[str, Any]
+) -> tuple[set[tuple[str, ...]], list[dict[str, Any]]]:
+    accepted: set[tuple[str, ...]] = set()
+    metadata: list[dict[str, Any]] = []
+    for path in paths:
+        try:
+            contents = path.read_bytes()
+            report = json.loads(contents)
+            if report.get("schema_version") != 3:
+                raise RuntimeError("correctness reference must use schema version 3")
+            if _reference_config(report) != expected_config:
+                raise RuntimeError(
+                    "correctness reference config does not match this run"
+                )
+            runs = report["controlled_concurrency"]["runs"]
+            signatures = set(_controlled_signatures(runs))
+        except (OSError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"cannot load correctness reference {path}") from exc
+        accepted.update(signatures)
+        metadata.append(
+            {
+                "report_sha256": hashlib.sha256(contents).hexdigest(),
+                "signature_count": len(signatures),
+            }
+        )
+    return accepted, metadata
+
+
+def _controlled_correctness(
+    runs: list[dict[str, Any]],
+    accepted: set[tuple[str, ...]],
+    references: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not references:
+        return {
+            "status": "not_evaluated",
+            "method": "exact_sorted_wav_sha256_multiset",
+            "reference_reports": [],
+            "matched_runs": 0,
+            "unmatched_signatures": [],
+        }
+
+    signatures = _controlled_signatures(runs)
+    unmatched = sorted(set(signatures) - accepted)
+    return {
+        "status": "pass" if not unmatched else "fail",
+        "method": "exact_sorted_wav_sha256_multiset",
+        "reference_reports": references,
+        "matched_runs": sum(signature in accepted for signature in signatures),
+        "unmatched_signatures": [list(signature) for signature in unmatched],
     }
 
 
 def main() -> None:
     args = _parse_args()
     payload = _request_payload(args)
+    config = {
+        "base_url": args.base_url,
+        "model": args.model,
+        "input": args.input_text,
+        "reference_audio": args.reference_audio,
+        "reference_text": args.reference_text,
+        "seed": args.seed,
+        "repetition_penalty": args.repetition_penalty,
+        "warmup": args.warmup,
+        "repetitions": args.repetitions,
+        "concurrency": args.concurrency,
+    }
+    accepted, references = _load_correctness_references(
+        args.correctness_reference,
+        {key: config[key] for key in _REFERENCE_CONFIG_KEYS},
+    )
     c1, c1_audio = _run_c1(args, payload)
-    c4 = _run_c4(args, payload)
-    determinism = _determinism(c1)
+    controlled = _run_controlled(args, payload)
+    c1_correctness = _c1_correctness(c1)
+    controlled_correctness = _controlled_correctness(controlled, accepted, references)
 
     if args.audio_dir is not None:
         for result, audio in zip(c1, c1_audio, strict=True):
             _write_audio(args.audio_dir, f"c1-{result['iteration']}.wav", audio)
-        for result in c4:
+        for result in controlled:
             for item, audio in zip(result["items"], result["audio"], strict=True):
                 _write_audio(
                     args.audio_dir,
-                    f"c4-{result['iteration']}-item-{item['index']}.wav",
+                    f"c{args.concurrency}-{result['iteration']}-item-"
+                    f"{item['index']}.wav",
                     audio,
                 )
 
     report = {
-        "schema_version": 2,
-        "config": {
-            "base_url": args.base_url,
-            "model": args.model,
-            "input": args.input_text,
-            "reference_audio": args.reference_audio,
-            "reference_text": args.reference_text,
-            "seed": args.seed,
-            "repetition_penalty": args.repetition_penalty,
-            "warmup": args.warmup,
-            "repetitions": args.repetitions,
-            "batch_size": args.batch_size,
-        },
+        "schema_version": 3,
+        "config": config,
         "c1": {
             "runs": c1,
             "wall_s": _summary([result["wall_s"] for result in c1]),
             "engine_time_s": _summary([result["engine_time_s"] for result in c1]),
         },
-        "controlled_c4": {
-            "layout_note": (
+        "controlled_concurrency": {
+            "concurrency": args.concurrency,
+            "correctness_note": (
                 "The batch endpoint controls arrival grouping, not the internal "
-                "scheduler layout. Layouts are recorded and are not a seeded "
-                "correctness assertion."
+                "scheduler layout. Correctness uses exact sorted WAV SHA-256 "
+                "multisets accepted by main reference reports."
             ),
-            "layouts": _c4_layouts(c4),
+            "signatures": _signature_counts(controlled),
             "runs": [
                 {key: value for key, value in result.items() if key != "audio"}
-                for result in c4
+                for result in controlled
             ],
-            "wall_s": _summary([result["wall_s"] for result in c4]),
+            "wall_s": _summary([result["wall_s"] for result in controlled]),
         },
-        "determinism": determinism,
+        "correctness": {
+            "c1": c1_correctness,
+            "controlled_concurrency": controlled_correctness,
+        },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
 
-    if not determinism["c1_byte_identical"]:
+    if c1_correctness["status"] != "pass":
         raise SystemExit(f"seeded audio identity check failed; see {args.output}")
+    if controlled_correctness["status"] == "fail":
+        raise SystemExit(
+            f"controlled-Cn correctness reference check failed; see {args.output}"
+        )
 
 
 if __name__ == "__main__":
