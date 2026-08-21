@@ -52,8 +52,9 @@ baseline is the midpoint of the two main medians. This brackets execution-order
 drift while retaining both observed main results.
 
 Logs from all three arms show Inductor graph activity. The independently started
-rebase and main-after arms each compiled 164 forward graphs. The server command
-line also records `--talker-torch-compile on` for every arm.
+rebase and main-after arms reach forward graph 164 during startup and graph 168
+after measured requests add specializations. The server command line also
+records `--talker-torch-compile on` for every arm.
 
 ## Default compile-on matrix
 
