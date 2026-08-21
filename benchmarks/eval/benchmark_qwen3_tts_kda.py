@@ -49,6 +49,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--input", required=True, dest="input_text")
     parser.add_argument("--seed", required=True, type=int)
     parser.add_argument("--repetition-penalty", type=float)
+    parser.add_argument("--max-new-tokens", type=int)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--audio-dir", type=Path)
     parser.add_argument("--repetitions", default=5, type=int)
@@ -76,6 +77,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--timeout-s must be positive")
     if args.repetition_penalty is not None and args.repetition_penalty <= 0:
         parser.error("--repetition-penalty must be positive")
+    if args.max_new_tokens is not None and args.max_new_tokens <= 0:
+        parser.error("--max-new-tokens must be positive")
     return args
 
 
@@ -94,6 +97,8 @@ def _request_payload(args: argparse.Namespace) -> dict[str, Any]:
     }
     if args.repetition_penalty is not None:
         payload["repetition_penalty"] = args.repetition_penalty
+    if args.max_new_tokens is not None:
+        payload["max_new_tokens"] = args.max_new_tokens
     return payload
 
 
@@ -289,6 +294,7 @@ _REFERENCE_CONFIG_KEYS = (
     "reference_text",
     "seed",
     "repetition_penalty",
+    "max_new_tokens",
     "concurrency",
 )
 
@@ -296,7 +302,10 @@ _REFERENCE_CONFIG_KEYS = (
 def _reference_config(report: dict[str, Any]) -> dict[str, Any]:
     try:
         config = report["config"]
-        return {key: config[key] for key in _REFERENCE_CONFIG_KEYS}
+        return {
+            key: config.get(key) if key == "max_new_tokens" else config[key]
+            for key in _REFERENCE_CONFIG_KEYS
+        }
     except (KeyError, TypeError) as exc:
         raise RuntimeError("correctness reference has an invalid config") from exc
 
@@ -368,6 +377,7 @@ def main() -> None:
         "reference_text": args.reference_text,
         "seed": args.seed,
         "repetition_penalty": args.repetition_penalty,
+        "max_new_tokens": args.max_new_tokens,
         "warmup": args.warmup,
         "repetitions": args.repetitions,
         "concurrency": args.concurrency,

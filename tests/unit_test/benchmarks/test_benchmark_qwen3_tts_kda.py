@@ -27,19 +27,27 @@ _controlled_signatures = _MODULE["_controlled_signatures"]
 _load_correctness_references = _MODULE["_load_correctness_references"]
 
 
-def _args(repetition_penalty: float | None) -> argparse.Namespace:
+def _args(
+    repetition_penalty: float | None, max_new_tokens: int | None = None
+) -> argparse.Namespace:
     return argparse.Namespace(
         model="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         reference_audio="file:///reference.wav",
         reference_text="reference transcript",
         seed=20260819,
         repetition_penalty=repetition_penalty,
+        max_new_tokens=max_new_tokens,
     )
 
 
 def test_request_payload_preserves_default_when_penalty_is_omitted() -> None:
     assert "repetition_penalty" not in _request_payload(_args(None))
     assert _request_payload(_args(1.0))["repetition_penalty"] == 1.0
+
+
+def test_request_payload_includes_fixed_generation_length() -> None:
+    assert "max_new_tokens" not in _request_payload(_args(None))
+    assert _request_payload(_args(None, max_new_tokens=64))["max_new_tokens"] == 64
 
 
 def test_parse_args_rejects_nonpositive_repetition_penalty(monkeypatch) -> None:
@@ -84,6 +92,31 @@ def test_parse_args_rejects_nonpositive_concurrency(monkeypatch) -> None:
             "--output",
             "report.json",
             "--concurrency",
+            "0",
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_args()
+
+
+def test_parse_args_rejects_nonpositive_max_new_tokens(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark_qwen3_tts_kda.py",
+            "--reference-audio",
+            "file:///reference.wav",
+            "--reference-text",
+            "reference transcript",
+            "--input",
+            "benchmark text",
+            "--seed",
+            "1",
+            "--output",
+            "report.json",
+            "--max-new-tokens",
             "0",
         ],
     )
@@ -177,6 +210,7 @@ def test_correctness_references_combine_exact_wav_hashes(tmp_path: Path) -> None
         "reference_text": "reference transcript",
         "seed": 20260819,
         "repetition_penalty": 1.05,
+        "max_new_tokens": 64,
         "concurrency": 4,
     }
     before = tmp_path / "before.json"
@@ -201,6 +235,7 @@ def test_correctness_reference_rejects_config_mismatch(tmp_path: Path) -> None:
         "reference_text": "reference transcript",
         "seed": 20260819,
         "repetition_penalty": 1.05,
+        "max_new_tokens": 64,
         "concurrency": 4,
     }
     reference = tmp_path / "reference.json"
@@ -210,3 +245,50 @@ def test_correctness_reference_rejects_config_mismatch(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="config does not match"):
         _load_correctness_references([reference], expected_config=config)
+
+
+def test_correctness_reference_rejects_generation_length_mismatch(
+    tmp_path: Path,
+) -> None:
+    config = {
+        "model": "model",
+        "input": "input",
+        "reference_audio": "file:///reference.wav",
+        "reference_text": "reference transcript",
+        "seed": 20260819,
+        "repetition_penalty": 1.05,
+        "max_new_tokens": 64,
+        "concurrency": 4,
+    }
+    reference = tmp_path / "reference.json"
+    reference.write_text(
+        json.dumps(_reference_report(dict(config, max_new_tokens=96), "hash"))
+    )
+
+    with pytest.raises(RuntimeError, match="config does not match"):
+        _load_correctness_references([reference], expected_config=config)
+
+
+def test_correctness_reference_accepts_legacy_missing_generation_length(
+    tmp_path: Path,
+) -> None:
+    config = {
+        "model": "model",
+        "input": "input",
+        "reference_audio": "file:///reference.wav",
+        "reference_text": "reference transcript",
+        "seed": 20260819,
+        "repetition_penalty": 1.05,
+        "max_new_tokens": None,
+        "concurrency": 4,
+    }
+    reference = tmp_path / "reference.json"
+    legacy_config = dict(config)
+    legacy_config.pop("max_new_tokens")
+    reference.write_text(json.dumps(_reference_report(legacy_config, "hash")))
+
+    accepted, _ = _load_correctness_references(
+        [reference], expected_config=config
+    )
+
+    assert accepted == {"hash"}
