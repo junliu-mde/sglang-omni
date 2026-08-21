@@ -145,6 +145,7 @@ def _audio_result(
         "engine_time_s": numeric_header("x-engine-time"),
         "completion_tokens": numeric_header("x-completion-tokens"),
         "prompt_tokens": numeric_header("x-prompt-tokens"),
+        "finish_reason": headers.get("x-finish-reason"),
         "headers": headers,
     }
 
@@ -174,6 +175,7 @@ def _batch_result(
                 "index": index,
                 "bytes": len(audio),
                 "sha256": hashlib.sha256(audio).hexdigest(),
+                "finish_reason": item.get("finish_reason"),
                 "audio": audio,
             }
         )

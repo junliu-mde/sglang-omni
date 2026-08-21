@@ -21,6 +21,7 @@ _SCRIPT = (
 _MODULE = runpy.run_path(str(_SCRIPT))
 _parse_args = _MODULE["_parse_args"]
 _request_payload = _MODULE["_request_payload"]
+_audio_result = _MODULE["_audio_result"]
 _batch_result = _MODULE["_batch_result"]
 _controlled_correctness = _MODULE["_controlled_correctness"]
 _controlled_signatures = _MODULE["_controlled_signatures"]
@@ -48,6 +49,17 @@ def test_request_payload_preserves_default_when_penalty_is_omitted() -> None:
 def test_request_payload_includes_fixed_generation_length() -> None:
     assert "max_new_tokens" not in _request_payload(_args(None))
     assert _request_payload(_args(None, max_new_tokens=64))["max_new_tokens"] == 64
+
+
+def test_audio_result_preserves_finish_reason_header() -> None:
+    result = _audio_result(
+        b"audio",
+        wall_s=1.0,
+        headers={"x-finish-reason": "length", "x-completion-tokens": "64"},
+    )
+
+    assert result["finish_reason"] == "length"
+    assert result["completion_tokens"] == 64
 
 
 def test_parse_args_rejects_nonpositive_repetition_penalty(monkeypatch) -> None:
@@ -140,6 +152,25 @@ def test_batch_result_rejects_missing_items() -> None:
 
     with pytest.raises(RuntimeError, match="unexpected number of items"):
         _batch_result(body, wall_s=1.0, expected_item_count=4)
+
+
+def test_batch_result_preserves_finish_reason() -> None:
+    body = json.dumps(
+        {
+            "results": [
+                {
+                    "status": "success",
+                    "index": 0,
+                    "audio_data": base64.b64encode(b"audio").decode(),
+                    "finish_reason": "length",
+                }
+            ]
+        }
+    ).encode()
+
+    result = _batch_result(body, wall_s=1.0, expected_item_count=1)
+
+    assert result["items"][0]["finish_reason"] == "length"
 
 
 def _controlled_run(*hashes: str) -> dict:

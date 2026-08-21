@@ -1261,18 +1261,19 @@ def _qwen3_tts_finish_reason(data: Qwen3TTSSGLangRequestData) -> str:
             else:
                 raw = to_json().get("type")
 
-    if raw is not None:
-        normalized = str(raw).lower()
+    normalized = str(raw).lower() if raw is not None else None
+    if normalized is not None:
         for known in ("length", "abort", "error"):
             if known in normalized:
                 return known
-        return str(raw)
 
-    # note (Junnan Li): the scheduler reason is absent when a stage owns the
-    # terminal step, and reaching the budget there is still a length stop.
+    # A model-owned stop can arrive on the same step as the request budget.
+    # Match SGLang's finish-state priority: the length cap wins on that step.
     max_new_tokens = data.max_new_tokens
     if max_new_tokens is not None and len(data.output_codes) >= int(max_new_tokens):
         return "length"
+    if raw is not None:
+        return str(raw)
     return "stop"
 
 

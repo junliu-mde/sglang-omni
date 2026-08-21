@@ -2440,6 +2440,21 @@ def test_qwen3_tts_result_adapter_infers_length_at_generation_budget() -> None:
     assert result.data["finish_reason"] == "length"
 
 
+def test_qwen3_tts_result_adapter_prefers_budget_over_same_step_stop() -> None:
+    payload = make_payload(inputs="target")
+    data = Qwen3TTSSGLangRequestData(
+        req=SimpleNamespace(output_ids=[]),
+        output_codes=[torch.tensor([1, 2]), torch.tensor([3, 4])],
+        stage_payload=payload,
+        finish_reason="stop",
+        max_new_tokens=2,
+    )
+
+    result = apply_sglang_qwen3_tts_result(payload, data)
+
+    assert result.data["finish_reason"] == "length"
+
+
 def test_qwen3_tts_state_round_trips_finish_reason() -> None:
     """The reason must survive the stage-payload state round trip."""
     state = Qwen3TTSState.from_dict({"finish_reason": "length"})
