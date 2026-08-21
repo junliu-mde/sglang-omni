@@ -1475,6 +1475,7 @@ def test_qwen3_tts_deterministic_vocoder_decodes_each_payload_at_b1() -> None:
         payload = make_payload(inputs=str(index))
         payload.data = Qwen3TTSState(
             audio_codes=torch.tensor([[index + 1, index + 2]]),
+            finish_reason="length",
         ).to_dict()
         payloads.append(payload)
 
@@ -1489,6 +1490,7 @@ def test_qwen3_tts_deterministic_vocoder_decodes_each_payload_at_b1() -> None:
         [2.0] * 4,
         [3.0] * 4,
     ]
+    assert [result.data["finish_reason"] for result in results] == ["length"] * 3
 
 
 def test_qwen3_tts_streaming_vocoder_default_initial_chunk_is_continuity_safe() -> None:
@@ -1866,6 +1868,7 @@ def test_qwen3_tts_streaming_vocoder_matches_full_decode() -> None:
         ref_code_len=2,
         prompt_tokens=2,
         completion_tokens=3,
+        finish_reason="length",
     ).to_dict()
 
     scheduler._on_streaming_new_request(payload.request_id, payload)
@@ -1914,6 +1917,7 @@ def test_qwen3_tts_streaming_vocoder_matches_full_decode() -> None:
             "completion_tokens": 3,
             "total_tokens": 5,
         },
+        "finish_reason": "length",
     }
     assert payload.request_id not in scheduler._stream_states
 
