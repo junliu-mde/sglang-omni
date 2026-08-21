@@ -787,6 +787,22 @@ def _apply_stage_torch_compile_override(
     )
 
 
+def _reject_unsupported_torch_compile_override(
+    pipeline_config: PipelineConfig,
+    *,
+    mode_flag_name: str,
+    max_bs_flag_name: str,
+    mode: _STAGE_TOGGLE_MODE,
+    max_bs: int | None,
+) -> None:
+    if type(pipeline_config).supports_sglang_torch_compile:
+        return
+    if mode == "on":
+        _raise_unsupported_flag(pipeline_config, mode_flag_name)
+    if max_bs is not None:
+        _raise_unsupported_flag(pipeline_config, max_bs_flag_name)
+
+
 def apply_cuda_graph_cli_overrides(
     pipeline_config: PipelineConfig,
     *,
@@ -993,6 +1009,13 @@ def apply_torch_compile_cli_overrides(
             if talker_mode != "default"
             else "--talker-torch-compile-max-bs"
         )
+        _reject_unsupported_torch_compile_override(
+            pipeline_config,
+            mode_flag_name="--talker-torch-compile",
+            max_bs_flag_name="--talker-torch-compile-max-bs",
+            mode=talker_mode,
+            max_bs=talker_torch_compile_max_bs,
+        )
         _apply_stage_torch_compile_override(
             pipeline_config,
             stage_name=_resolve_talker_sglang_stage(
@@ -1011,6 +1034,13 @@ def apply_torch_compile_cli_overrides(
             "--torch-compile"
             if generation_mode != "default"
             else "--torch-compile-max-bs"
+        )
+        _reject_unsupported_torch_compile_override(
+            pipeline_config,
+            mode_flag_name="--torch-compile",
+            max_bs_flag_name="--torch-compile-max-bs",
+            mode=generation_mode,
+            max_bs=torch_compile_max_bs,
         )
         generation_stage = (
             type(pipeline_config).generation_sglang_role_to_stage().get("generation")

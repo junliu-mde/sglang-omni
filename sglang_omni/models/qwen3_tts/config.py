@@ -22,6 +22,7 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
 
     architecture: ClassVar[str] = "Qwen3TTSForConditionalGeneration"
     requires_model_capabilities: ClassVar[bool] = True
+    supports_sglang_torch_compile: ClassVar[bool] = False
 
     @classmethod
     def generation_sglang_role_to_stage(cls) -> dict[str, str]:
@@ -64,8 +65,8 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
 
     model_path: str
     # note (0xtoward): Keep deterministic inference opt-in because it serializes
-    # preprocessing and vocoder decoding and disables Talker compilation and the
-    # initial vocoder CUDA Graph, reducing throughput.
+    # preprocessing and vocoder decoding and disables the initial vocoder CUDA
+    # Graph, reducing throughput.
     enable_deterministic_inference: bool = False
     stages: list[StageConfig] = [
         StageConfig(

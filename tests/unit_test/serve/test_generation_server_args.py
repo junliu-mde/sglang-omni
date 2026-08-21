@@ -207,7 +207,6 @@ def test_qwen3_tts_cli_routes_64_batch_policy_to_tts_engine(
         **_serve_kwargs(
             max_running_requests=64,
             cuda_graph_max_bs=64,
-            talker_torch_compile_max_bs=64,
         )
     )
 
@@ -215,8 +214,40 @@ def test_qwen3_tts_cli_routes_64_batch_policy_to_tts_engine(
     overrides = _stage_args(launched_config, "tts_engine")["server_args_overrides"]
     assert overrides["max_running_requests"] == 64
     assert overrides["cuda_graph_max_bs"] == 64
-    assert overrides["torch_compile_max_bs"] == 64
     assert "server_args_overrides" not in _stage_args(launched_config, "vocoder")
+
+
+@pytest.mark.parametrize(
+    "kwargs,flag_name",
+    [
+        ({"talker_torch_compile": "on"}, "--talker-torch-compile"),
+        ({"talker_torch_compile_max_bs": 64}, "--talker-torch-compile-max-bs"),
+        (
+            {"talker_torch_compile": "off", "talker_torch_compile_max_bs": 64},
+            "--talker-torch-compile-max-bs",
+        ),
+        ({"torch_compile": "on"}, "--torch-compile"),
+        ({"torch_compile_max_bs": 64}, "--torch-compile-max-bs"),
+    ],
+)
+@patch("sglang_omni.cli.serve.launch_server")
+@patch("sglang_omni.cli.serve.ConfigManager.from_model_path")
+def test_qwen3_tts_cli_rejects_torch_compile_before_launch(
+    from_model_path,
+    launch_server,
+    kwargs,
+    flag_name,
+) -> None:
+    config = Qwen3TTSPipelineConfig(model_path="dummy")
+    from_model_path.return_value = _DummyManager(config)
+
+    with pytest.raises(
+        typer.BadParameter,
+        match=f"{flag_name} is not supported by Qwen3TTSPipelineConfig",
+    ):
+        serve(**_serve_kwargs(**kwargs))
+
+    launch_server.assert_not_called()
 
 
 def test_qwen3_tts_coordinator_cap_uses_engine_defaults_and_cli_overlay() -> None:
