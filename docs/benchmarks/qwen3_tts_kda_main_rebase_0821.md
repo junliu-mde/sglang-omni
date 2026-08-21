@@ -2,17 +2,17 @@
 
 ## Conclusion
 
-On the fixed Qwen3-TTS workload below, the rebased sync stack reduces the C1
-wall-time median by 20.9%, the C1 engine-time median by 21.9%, the controlled C4
-wall-time median by 18.2%, and the controlled C8 wall-time median by 9.3%
-relative to the bracketed original-main baseline.
+The default Talker `torch.compile`-on comparison fails its output gate. Original
+main produces 106 completion tokens for every C1 request, while the rebase
+produces 96. The two original-main arms have one exact WAV SHA-256 and the
+rebase has a different exact WAV SHA-256. Controlled C4 matches the finite main
+hash union for 33/40 WAVs; C8 matches 24/80. The compile-on timing deltas below
+are diagnostic only and are not valid performance gains.
 
-The standard matrix observes byte-identical C1 output and main-reference
-membership for all 40 C4 and 80 C8 rebase WAVs. An expanded C8 audit shows that
-finite hash-set membership is not a complete parity gate: a main-equivalent
-repeat also produces a hash absent from the earlier main set. A separate
-correctness-only run fixes both the C8 prefill layout and vocoder execution. It
-passes 160/160 exact WAV comparisons between original main and the rebase.
+The earlier Talker `torch.compile`-off matrix passes the available output checks
+and remains useful as a secondary historical comparison. It reports -20.9% C1
+wall, -21.9% C1 engine, -18.2% C4 wall, and -9.3% C8 wall. Those values do not
+describe the default compile-on configuration.
 
 Crossed multi-round tests do not support enabling async lookahead by default.
 Async is 4.0% slower on short C4 and 8.1% slower on short C8. The long C4 and C8
@@ -37,18 +37,73 @@ the C8 change to async.
   `fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1`
 - `qwen-tts`: `0.1.1`
 - `accelerate`: `1.12.0`
-- Talker `torch.compile`: off
+- Talker `torch.compile`: on
+- Compile mode: `max-autotune-no-cudagraphs`
 - Seed: `20260819`
 - Repetition penalty: `1.05`
 - One warm-up followed by ten measured requests per arm
 - C1: one request at a time
 - Controlled Cn: C requests submitted through one batch-endpoint arrival group
+- A 60-second post-health startup interval keeps background vocoder CUDA Graph
+  capture outside every measured request.
 
 The standard matrix ran main before the rebase arm and main again after it. The
 baseline is the midpoint of the two main medians. This brackets execution-order
 drift while retaining both observed main results.
 
-## Main vs rebase
+Logs from all three arms show Inductor graph activity. The independently started
+rebase and main-after arms each compiled 164 forward graphs. The server command
+line also records `--talker-torch-compile on` for every arm.
+
+## Default compile-on matrix
+
+The `Delta` column is `rebase - main midpoint`. Negative values would be faster
+only if the output gate passed.
+
+| Metric | Main before | Main after | Main midpoint | Rebase sync | Delta | Change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| C1 wall median | 0.987714 s | 1.007131 s | 0.997423 s | 0.808241 s | -0.189181 s | -19.0% |
+| C1 engine median | 0.935539 s | 0.936471 s | 0.936005 s | 0.737450 s | -0.198555 s | -21.2% |
+| Controlled C4 wall median | 1.391972 s | 1.324214 s | 1.358093 s | 1.262973 s | -0.095120 s | -7.0% |
+| Controlled C8 wall median | 1.622121 s | 1.639036 s | 1.630579 s | 1.231981 s | -0.398598 s | -24.4% |
+
+### Compile-on output gate
+
+All 20 C1 runs from the two original-main arms produce 106 completion tokens
+and this WAV SHA-256:
+
+```text
+cd5099e8d3cd123d027ef31a99a5e548efbcfd5128a18d6bac39446eb6151a7b
+```
+
+All ten rebase C1 runs produce 96 completion tokens and this different WAV
+SHA-256:
+
+```text
+07b58d6d3aee1d4f3b01571b95ff039dc4ac88d18ff193250efbea6170151645
+```
+
+This stable C1 length and hash difference is a correctness failure. It is not a
+vocoder batch-layout artifact.
+
+For controlled concurrency, the check accepts the union of every exact WAV hash
+from main-before and main-after:
+
+| Workload | Rebase WAVs in main union | Rebase distinct hashes | Unseen distinct hashes | Result |
+| --- | ---: | ---: | ---: | --- |
+| C4 | 33/40 | 5 | 3 | Fail |
+| C8 | 24/80 | 12 | 2 | Fail |
+
+Finite Cn membership is not a complete parity proof. Its failure is supporting
+evidence here; the fixed-layout C1 failure is decisive. A diagnostic rebase run
+kept Talker compile on and disabled the Predictor CUDA Graph. It produced a
+third stable output of 100 completion tokens, so disabling that graph does not
+restore original-main output.
+
+## Earlier compile-off matrix
+
+This separate historical matrix uses Talker `torch.compile` off. It must not be
+used as the default-configuration result.
 
 | Metric | Main before | Main after | Main midpoint | Rebase sync | Change |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -57,7 +112,7 @@ drift while retaining both observed main results.
 | Controlled C4 wall median | 1.382967 s | 1.371367 s | 1.377167 s | 1.126911 s | **-18.2%** |
 | Controlled C8 wall median | 1.522798 s | 1.460790 s | 1.491794 s | 1.352928 s | **-9.3%** |
 
-## Output checks
+## Compile-off output checks
 
 Every C1 arm produced this WAV SHA-256:
 
