@@ -11,7 +11,6 @@ from pathlib import Path
 
 import pytest
 
-
 _SCRIPT = (
     Path(__file__).resolve().parents[3]
     / "benchmarks"
@@ -137,6 +136,33 @@ def test_parse_args_rejects_nonpositive_max_new_tokens(monkeypatch) -> None:
         _parse_args()
 
 
+def test_parse_args_requires_fixed_layout_for_correctness_reference(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark_qwen3_tts_kda.py",
+            "--reference-audio",
+            "file:///reference.wav",
+            "--reference-text",
+            "reference transcript",
+            "--input",
+            "benchmark text",
+            "--seed",
+            "1",
+            "--output",
+            "report.json",
+            "--correctness-reference",
+            "main.json",
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        _parse_args()
+
+
 def test_batch_result_rejects_missing_items() -> None:
     body = json.dumps(
         {
@@ -187,54 +213,86 @@ def test_controlled_signatures_ignore_response_item_order() -> None:
     ]
 
 
-def test_controlled_correctness_accepts_new_layout_of_exact_main_hashes() -> None:
-    runs = [
-        _controlled_run("hash-b", "hash-a"),
-        _controlled_run("hash-a", "hash-a"),
-    ]
-    accepted = {"hash-a", "hash-b"}
-
+def test_controlled_correctness_accepts_stable_exact_signature() -> None:
     result = _controlled_correctness(
-        runs,
-        accepted,
-        [{"report_sha256": "main", "hash_count": 2}],
+        [
+            _controlled_run("hash-b", "hash-a"),
+            _controlled_run("hash-a", "hash-b"),
+        ],
+        ("hash-a", "hash-b"),
+        [{"report_sha256": "main", "signature": ["hash-a", "hash-b"]}],
+        fixed_vocoder_layout=True,
     )
 
     assert result["status"] == "pass"
-    assert result["matched_items"] == 4
-    assert result["total_items"] == 4
-    assert result["unmatched_hashes"] == []
+    assert result["stable_across_runs"] is True
+    assert result["observed_signatures"] == [["hash-a", "hash-b"]]
 
 
-def test_controlled_correctness_rejects_unseen_exact_wav_hash() -> None:
+def test_controlled_correctness_rejects_new_layout_of_known_hashes() -> None:
     result = _controlled_correctness(
-        [_controlled_run("changed", "hash-a")],
-        {"hash-a", "hash-b"},
-        [{"report_sha256": "main", "hash_count": 2}],
+        [_controlled_run("hash-a", "hash-a")],
+        ("hash-a", "hash-b"),
+        [{"report_sha256": "main", "signature": ["hash-a", "hash-b"]}],
+        fixed_vocoder_layout=True,
     )
 
     assert result["status"] == "fail"
-    assert result["matched_items"] == 1
-    assert result["total_items"] == 2
-    assert result["unmatched_hashes"] == ["changed"]
+    assert result["stable_across_runs"] is True
+    assert result["observed_signatures"] == [["hash-a", "hash-a"]]
+
+
+def test_controlled_correctness_rejects_same_arm_signature_drift() -> None:
+    result = _controlled_correctness(
+        [
+            _controlled_run("hash-a", "hash-b"),
+            _controlled_run("hash-a", "hash-a"),
+        ],
+        ("hash-a", "hash-b"),
+        [{"report_sha256": "main", "signature": ["hash-a", "hash-b"]}],
+        fixed_vocoder_layout=True,
+    )
+
+    assert result["status"] == "fail"
+    assert result["stable_across_runs"] is False
 
 
 def test_controlled_correctness_is_explicit_without_references() -> None:
-    result = _controlled_correctness([_controlled_run("hash-a", "hash-b")], set(), [])
+    result = _controlled_correctness(
+        [_controlled_run("hash-a", "hash-b")],
+        None,
+        [],
+        fixed_vocoder_layout=False,
+    )
 
     assert result["status"] == "not_evaluated"
 
 
+def test_fixed_layout_baseline_requires_stable_signature() -> None:
+    result = _controlled_correctness(
+        [
+            _controlled_run("hash-a", "hash-b"),
+            _controlled_run("hash-b", "hash-a"),
+        ],
+        None,
+        [],
+        fixed_vocoder_layout=True,
+    )
+
+    assert result["status"] == "pass"
+    assert result["stable_across_runs"] is True
+
+
 def _reference_report(config: dict, *hashes: str) -> dict:
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "config": config,
         "controlled_concurrency": {"runs": [_controlled_run(*hashes)]},
     }
 
 
-def test_correctness_references_combine_exact_wav_hashes(tmp_path: Path) -> None:
-    config = {
+def _fixed_reference_config() -> dict:
+    return {
         "model": "model",
         "input": "input",
         "reference_audio": "file:///reference.wav",
@@ -243,32 +301,42 @@ def test_correctness_references_combine_exact_wav_hashes(tmp_path: Path) -> None
         "repetition_penalty": 1.05,
         "max_new_tokens": 64,
         "concurrency": 4,
+        "fixed_vocoder_layout": True,
     }
+
+
+def test_correctness_references_require_one_exact_signature(tmp_path: Path) -> None:
+    config = _fixed_reference_config()
     before = tmp_path / "before.json"
     after = tmp_path / "after.json"
     before.write_text(json.dumps(_reference_report(config, "hash-a", "hash-b")))
-    after.write_text(json.dumps(_reference_report(config, "hash-c", "hash-c")))
+    after.write_text(json.dumps(_reference_report(config, "hash-b", "hash-a")))
 
-    accepted, metadata = _load_correctness_references(
+    signature, metadata = _load_correctness_references(
         [before, after], expected_config=config
     )
 
-    assert accepted == {"hash-a", "hash-b", "hash-c"}
-    assert [entry["hash_count"] for entry in metadata] == [2, 1]
+    assert signature == ("hash-a", "hash-b")
+    assert [entry["signature"] for entry in metadata] == [
+        ["hash-a", "hash-b"],
+        ["hash-a", "hash-b"],
+    ]
     assert all("report_sha256" in entry for entry in metadata)
 
 
+def test_correctness_references_reject_conflicting_signatures(tmp_path: Path) -> None:
+    config = _fixed_reference_config()
+    before = tmp_path / "before.json"
+    after = tmp_path / "after.json"
+    before.write_text(json.dumps(_reference_report(config, "hash-a", "hash-b")))
+    after.write_text(json.dumps(_reference_report(config, "hash-a", "hash-a")))
+
+    with pytest.raises(RuntimeError, match="disagrees with earlier references"):
+        _load_correctness_references([before, after], expected_config=config)
+
+
 def test_correctness_reference_rejects_config_mismatch(tmp_path: Path) -> None:
-    config = {
-        "model": "model",
-        "input": "input",
-        "reference_audio": "file:///reference.wav",
-        "reference_text": "reference transcript",
-        "seed": 20260819,
-        "repetition_penalty": 1.05,
-        "max_new_tokens": 64,
-        "concurrency": 4,
-    }
+    config = _fixed_reference_config()
     reference = tmp_path / "reference.json"
     reference.write_text(
         json.dumps(_reference_report(dict(config, concurrency=8), "hash"))
@@ -281,16 +349,7 @@ def test_correctness_reference_rejects_config_mismatch(tmp_path: Path) -> None:
 def test_correctness_reference_rejects_generation_length_mismatch(
     tmp_path: Path,
 ) -> None:
-    config = {
-        "model": "model",
-        "input": "input",
-        "reference_audio": "file:///reference.wav",
-        "reference_text": "reference transcript",
-        "seed": 20260819,
-        "repetition_penalty": 1.05,
-        "max_new_tokens": 64,
-        "concurrency": 4,
-    }
+    config = _fixed_reference_config()
     reference = tmp_path / "reference.json"
     reference.write_text(
         json.dumps(_reference_report(dict(config, max_new_tokens=96), "hash"))
@@ -300,26 +359,12 @@ def test_correctness_reference_rejects_generation_length_mismatch(
         _load_correctness_references([reference], expected_config=config)
 
 
-def test_correctness_reference_accepts_legacy_missing_generation_length(
-    tmp_path: Path,
-) -> None:
-    config = {
-        "model": "model",
-        "input": "input",
-        "reference_audio": "file:///reference.wav",
-        "reference_text": "reference transcript",
-        "seed": 20260819,
-        "repetition_penalty": 1.05,
-        "max_new_tokens": None,
-        "concurrency": 4,
-    }
+def test_correctness_reference_rejects_legacy_schema(tmp_path: Path) -> None:
+    config = _fixed_reference_config()
     reference = tmp_path / "reference.json"
-    legacy_config = dict(config)
-    legacy_config.pop("max_new_tokens")
-    reference.write_text(json.dumps(_reference_report(legacy_config, "hash")))
+    report = _reference_report(config, "hash")
+    report["schema_version"] = 3
+    reference.write_text(json.dumps(report))
 
-    accepted, _ = _load_correctness_references(
-        [reference], expected_config=config
-    )
-
-    assert accepted == {"hash"}
+    with pytest.raises(RuntimeError, match="must use schema version 4"):
+        _load_correctness_references([reference], expected_config=config)

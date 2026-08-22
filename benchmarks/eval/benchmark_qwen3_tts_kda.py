@@ -1,11 +1,11 @@
 """Measure seeded Qwen3-TTS behavior for C1 and controlled Cn workloads.
 
-This script is deliberately small.  It sends a fixed voice-cloning request to
+This script is deliberately small. It sends a fixed voice-cloning request to
 the public HTTP API, records end-to-end wall time and response metadata, and
 checks C1 audio byte identity. Cn uses ``/v1/audio/speech/batch`` so all items
-enter the server in one arrival group. The endpoint does not promise a fixed
-scheduler batch layout. Cn correctness therefore requires every exact WAV
-SHA-256 to appear in a main reference report, without pairing runs or layouts.
+enter the server in one arrival group. Cn correctness additionally requires a
+server started with ``enable_deterministic_inference: true`` and exact equality
+of the complete, sorted WAV SHA-256 signature across every run and reference.
 
 Example::
 
@@ -16,6 +16,7 @@ Example::
         --input "Text to synthesize." \
         --seed 20260819 \
         --concurrency 8 \
+        --fixed-vocoder-layout \
         --correctness-reference /tmp/main-before.json \
         --correctness-reference /tmp/main-after.json \
         --output /tmp/qwen3-tts.json
@@ -33,7 +34,6 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
-
 
 DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 
@@ -56,13 +56,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", default=1, type=int)
     parser.add_argument("--concurrency", default=4, type=int)
     parser.add_argument(
+        "--fixed-vocoder-layout",
+        action="store_true",
+        help=(
+            "Assert that the server uses enable_deterministic_inference: true. "
+            "Required for controlled-Cn correctness evaluation."
+        ),
+    )
+    parser.add_argument(
         "--correctness-reference",
         action="append",
         default=[],
         type=Path,
         help=(
-            "Main report whose exact controlled-Cn WAV hashes are accepted. "
-            "May be specified more than once."
+            "Fixed-layout main report whose complete controlled-Cn WAV "
+            "signature must match. May be specified more than once."
         ),
     )
     parser.add_argument("--timeout-s", default=180.0, type=float)
@@ -79,6 +87,11 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--repetition-penalty must be positive")
     if args.max_new_tokens is not None and args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be positive")
+    if args.correctness_reference and not args.fixed_vocoder_layout:
+        parser.error(
+            "--correctness-reference requires --fixed-vocoder-layout and a "
+            "server started with enable_deterministic_inference: true"
+        )
     return args
 
 
@@ -264,10 +277,6 @@ def _controlled_signatures(
     ]
 
 
-def _controlled_hashes(runs: list[dict[str, Any]]) -> list[str]:
-    return [item["sha256"] for result in runs for item in result["items"]]
-
-
 def _signature_counts(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     counts: dict[tuple[str, ...], int] = {}
     for signature in _controlled_signatures(runs):
@@ -298,73 +307,94 @@ _REFERENCE_CONFIG_KEYS = (
     "repetition_penalty",
     "max_new_tokens",
     "concurrency",
+    "fixed_vocoder_layout",
 )
 
 
 def _reference_config(report: dict[str, Any]) -> dict[str, Any]:
     try:
         config = report["config"]
-        return {
-            key: config.get(key) if key == "max_new_tokens" else config[key]
-            for key in _REFERENCE_CONFIG_KEYS
-        }
+        return {key: config[key] for key in _REFERENCE_CONFIG_KEYS}
     except (KeyError, TypeError) as exc:
         raise RuntimeError("correctness reference has an invalid config") from exc
 
 
 def _load_correctness_references(
     paths: list[Path], expected_config: dict[str, Any]
-) -> tuple[set[str], list[dict[str, Any]]]:
-    accepted: set[str] = set()
+) -> tuple[tuple[str, ...] | None, list[dict[str, Any]]]:
+    expected_signature: tuple[str, ...] | None = None
     metadata: list[dict[str, Any]] = []
     for path in paths:
         try:
             contents = path.read_bytes()
             report = json.loads(contents)
-            if report.get("schema_version") != 3:
-                raise RuntimeError("correctness reference must use schema version 3")
+            if report.get("schema_version") != 4:
+                raise RuntimeError("correctness reference must use schema version 4")
             if _reference_config(report) != expected_config:
                 raise RuntimeError(
                     "correctness reference config does not match this run"
                 )
             runs = report["controlled_concurrency"]["runs"]
-            hashes = set(_controlled_hashes(runs))
+            signatures = set(_controlled_signatures(runs))
         except (OSError, TypeError, KeyError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"cannot load correctness reference {path}") from exc
-        accepted.update(hashes)
+        if len(signatures) != 1:
+            raise RuntimeError(
+                f"correctness reference {path} does not have one stable "
+                "controlled-Cn signature"
+            )
+        (signature,) = signatures
+        if expected_signature is None:
+            expected_signature = signature
+        elif signature != expected_signature:
+            raise RuntimeError(
+                f"correctness reference {path} disagrees with earlier references"
+            )
         metadata.append(
             {
                 "report_sha256": hashlib.sha256(contents).hexdigest(),
-                "hash_count": len(hashes),
+                "signature": list(signature),
             }
         )
-    return accepted, metadata
+    return expected_signature, metadata
 
 
 def _controlled_correctness(
     runs: list[dict[str, Any]],
-    accepted: set[str],
+    expected_signature: tuple[str, ...] | None,
     references: list[dict[str, Any]],
+    *,
+    fixed_vocoder_layout: bool,
 ) -> dict[str, Any]:
-    if not references:
+    signatures = _controlled_signatures(runs)
+    unique_signatures = sorted(set(signatures))
+    if not fixed_vocoder_layout:
         return {
             "status": "not_evaluated",
-            "method": "exact_wav_sha256_membership",
+            "method": "fixed_vocoder_layout_exact_wav_sha256",
+            "reason": (
+                "controlled-Cn correctness requires a server started with "
+                "enable_deterministic_inference: true"
+            ),
             "reference_reports": [],
-            "matched_items": 0,
-            "total_items": sum(len(result["items"]) for result in runs),
-            "unmatched_hashes": [],
+            "stable_across_runs": None,
+            "expected_signature": None,
+            "observed_signatures": [],
         }
 
-    hashes = _controlled_hashes(runs)
-    unmatched = sorted(set(hashes) - accepted)
+    stable = len(unique_signatures) == 1
+    matches_reference = expected_signature is None or (
+        stable and unique_signatures[0] == expected_signature
+    )
     return {
-        "status": "pass" if not unmatched else "fail",
-        "method": "exact_wav_sha256_membership",
+        "status": "pass" if stable and matches_reference else "fail",
+        "method": "fixed_vocoder_layout_exact_wav_sha256",
         "reference_reports": references,
-        "matched_items": sum(sha256 in accepted for sha256 in hashes),
-        "total_items": len(hashes),
-        "unmatched_hashes": unmatched,
+        "stable_across_runs": stable,
+        "expected_signature": (
+            list(expected_signature) if expected_signature is not None else None
+        ),
+        "observed_signatures": [list(signature) for signature in unique_signatures],
     }
 
 
@@ -383,15 +413,21 @@ def main() -> None:
         "warmup": args.warmup,
         "repetitions": args.repetitions,
         "concurrency": args.concurrency,
+        "fixed_vocoder_layout": args.fixed_vocoder_layout,
     }
-    accepted, references = _load_correctness_references(
+    expected_signature, references = _load_correctness_references(
         args.correctness_reference,
         {key: config[key] for key in _REFERENCE_CONFIG_KEYS},
     )
     c1, c1_audio = _run_c1(args, payload)
     controlled = _run_controlled(args, payload)
     c1_correctness = _c1_correctness(c1)
-    controlled_correctness = _controlled_correctness(controlled, accepted, references)
+    controlled_correctness = _controlled_correctness(
+        controlled,
+        expected_signature,
+        references,
+        fixed_vocoder_layout=args.fixed_vocoder_layout,
+    )
 
     if args.audio_dir is not None:
         for result, audio in zip(c1, c1_audio, strict=True):
@@ -406,7 +442,7 @@ def main() -> None:
                 )
 
     report = {
-        "schema_version": 3,
+        "schema_version": 4,
         "config": config,
         "c1": {
             "runs": c1,
@@ -416,9 +452,10 @@ def main() -> None:
         "controlled_concurrency": {
             "concurrency": args.concurrency,
             "correctness_note": (
-                "The batch endpoint controls arrival grouping, not the internal "
-                "scheduler layout. Every exact WAV SHA-256 must appear in a "
-                "main reference report; runs and layouts are not paired."
+                "Controlled-Cn correctness is evaluated only with "
+                "enable_deterministic_inference: true. The complete sorted WAV "
+                "SHA-256 signature must be identical across every run and main "
+                "reference report."
             ),
             "signatures": _signature_counts(controlled),
             "runs": [

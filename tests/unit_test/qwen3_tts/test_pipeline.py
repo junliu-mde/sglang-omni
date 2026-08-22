@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sys
 import threading
 import time
@@ -277,6 +278,12 @@ def test_qwen3_tts_deterministic_inference_configures_pipeline() -> None:
     assert tts_engine["server_args_overrides"]["enable_deterministic_inference"]
     assert vocoder["enable_deterministic_inference"]
     assert vocoder["initial_cuda_graph"] is False
+
+
+def test_qwen3_tts_async_decode_is_opt_in() -> None:
+    signature = inspect.signature(qwen3_stages.create_sglang_tts_engine_executor)
+
+    assert signature.parameters["enable_async_decode"].default is False
 
 
 @pytest.mark.parametrize(
