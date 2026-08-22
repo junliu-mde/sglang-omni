@@ -60,13 +60,13 @@ def _predictor_graph_env_enabled() -> bool:
 
 
 def _predictor_fused_kv_cache_env_enabled() -> bool:
-    value = os.environ.get(QTTS_PREDICTOR_FUSED_KV_CACHE_ENV, "1").strip().lower()
+    value = os.environ.get(QTTS_PREDICTOR_FUSED_KV_CACHE_ENV, "0").strip().lower()
     return value not in ("0", "false", "off", "no")
 
 
 def _predictor_fused_first_token_attention_env_enabled() -> bool:
     value = (
-        os.environ.get(QTTS_PREDICTOR_FUSED_FIRST_TOKEN_ATTENTION_ENV, "1")
+        os.environ.get(QTTS_PREDICTOR_FUSED_FIRST_TOKEN_ATTENTION_ENV, "0")
         .strip()
         .lower()
     )
@@ -1822,7 +1822,7 @@ class Qwen3TTSTalker(nn.Module):
         fused_first_token_attention = (
             cache_len == 0
             and first_token_buffer is not None
-            and getattr(self, "_predictor_fused_first_token_attention_enabled", True)
+            and getattr(self, "_predictor_fused_first_token_attention_enabled", False)
             and (
                 torch.cuda.is_current_stream_capturing()
                 or allow_eager_first_token_warmup
@@ -1841,7 +1841,7 @@ class Qwen3TTSTalker(nn.Module):
             attn_output = first_token_buffer
         else:
             if not (
-                getattr(self, "_predictor_fused_kv_cache_enabled", True)
+                getattr(self, "_predictor_fused_kv_cache_enabled", False)
                 and store_predictor_kv_cache(k, v, key_cache_slot, value_cache_slot)
             ):
                 key_cache_slot.copy_(k)
