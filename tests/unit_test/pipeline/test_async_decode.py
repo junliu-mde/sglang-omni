@@ -20,6 +20,7 @@ from unittest import mock
 import pytest
 import torch
 
+from sglang_omni.scheduling import omni_scheduler as omni_scheduler_module
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.types import (

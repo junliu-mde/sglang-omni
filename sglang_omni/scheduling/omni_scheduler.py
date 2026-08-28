@@ -20,6 +20,7 @@ import time
 import types
 from array import array
 from collections import deque
+import contextlib
 from concurrent.futures import Future, ThreadPoolExecutor
 from itertools import islice
 from typing import Any, Callable
@@ -2490,6 +2491,7 @@ class OmniScheduler:
             batch.decoding_reqs = [r for r in batch.decoding_reqs if id(r) in kept_ids]
         return batch if batch.reqs else None
 
+    @contextlib.contextmanager
     def _skip_precommitted_penalty_cumulate(self):
         """Replace one host-history update after an async device commit.
 
