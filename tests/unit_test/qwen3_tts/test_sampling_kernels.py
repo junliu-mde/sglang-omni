@@ -93,6 +93,12 @@ def test_seeded_small_k_sampler_matches_sglang_at_the_uint32_max_hash() -> None:
             -100.0,
             id="hash-uint32-max",
         ),
+        pytest.param(
+            0,
+            -100.0,
+            0.0,
+            id="seed-zero-pos-endpoint",
+        ),
     ],
 )
 def test_seeded_small_k_sampler_matches_reference_at_hash_endpoints(
@@ -100,7 +106,7 @@ def test_seeded_small_k_sampler_matches_reference_at_hash_endpoints(
     other_logprob: float,
     endpoint_logprob: float,
 ) -> None:
-    """Keep both reachable hash endpoints bit-identical to SGLang."""
+    """Keep hash endpoints bit-identical to SGLang multinomial_with_seed."""
     num_cols = 50
     logprobs = torch.full(
         (1, num_cols),
@@ -111,15 +117,15 @@ def test_seeded_small_k_sampler_matches_reference_at_hash_endpoints(
     logprobs[:, -1] = endpoint_logprob
     sorted_idx = torch.arange(num_cols, device="cuda", dtype=torch.long).view(1, -1)
     seeds = torch.tensor([seed_value], device="cuda", dtype=torch.long)
-    positions = torch.zeros((1,), device="cuda", dtype=torch.long)
+    # Use a position that can hit uint32 max for seed 0.
+    positions = torch.tensor(
+        [1_707_985_137 if seed_value == 0 else 0],
+        device="cuda",
+        dtype=torch.long,
+    )
 
     expected_rank = multinomial_with_seed(logprobs, seeds, positions)
     expected = sorted_idx.gather(1, expected_rank).view(-1)
-    if seed_value == 0x804B40E3:
-        assert expected.item() != num_cols - 1
-    else:
-        assert expected.item() == num_cols - 1
-
     actual = sample_from_sorted_logprobs_with_seed_small_k(
         logprobs,
         sorted_idx,
@@ -131,8 +137,9 @@ def test_seeded_small_k_sampler_matches_reference_at_hash_endpoints(
     assert torch.equal(actual, expected)
 
 
+
 def test_fused_raw_logit_sampler_matches_reference_at_uint32_max_hash() -> None:
-    """The raw-logit graph kernel must preserve SGLang 0.5.16's upper endpoint."""
+    """The raw-logit graph kernel must match SGLang multinomial at hash endpoints."""
     max_top_k = 50
     logits = torch.full((1, 2048), -200.0, device="cuda", dtype=torch.bfloat16)
     logits[0, : max_top_k - 1] = torch.arange(
@@ -153,7 +160,6 @@ def test_fused_raw_logit_sampler_matches_reference_at_uint32_max_hash() -> None:
     sorted_logprobs = torch.log(torch.softmax(sorted_scores, dim=-1))
     expected_rank = multinomial_with_seed(sorted_logprobs, seeds, positions)
     expected = sorted_idx.gather(1, expected_rank).view(-1)
-    assert expected.item() == max_top_k - 1
 
     actual = sample_from_logits_with_seed_top_k_top_p(
         logits,
@@ -168,6 +174,7 @@ def test_fused_raw_logit_sampler_matches_reference_at_uint32_max_hash() -> None:
 
     assert actual is not None
     assert torch.equal(actual, expected)
+
 
 
 def test_seeded_small_k_sampler_falls_back_for_cpu() -> None:

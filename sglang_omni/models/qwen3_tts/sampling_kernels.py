@@ -44,11 +44,12 @@ if triton is not None:
 
     @triton.jit
     def _gumbel_from_hash(h: tl.uint32):
-        """Match SGLang 0.5.16's float64 endpoint handling."""
-        x = h.to(tl.float64) / 4294967295.0
-        x = tl.log(x)
-        x = tl.maximum(x, -1.7976931348623157e308)
-        return -tl.log(-x)
+        """Match SGLang multinomial_with_seed float64 endpoint handling."""
+        u = h.to(tl.float64) / 4294967295.0
+        u = tl.maximum(u, 2.2250738585072014e-308)
+        # Cap log(u) at -(2 ** -32) so a uniform of exactly 1 cannot produce +inf.
+        log_u = tl.minimum(tl.log(u), -2.3283064365386963e-10)
+        return -tl.log(-log_u)
 
     @triton.jit
     def _seeded_gumbel_sample_sorted_kernel(
@@ -80,12 +81,7 @@ if triton is not None:
         h ^= 16
         h = _fmix32(h)
 
-        u = h.to(tl.float64) / 4294967295.0
-        u = tl.maximum(u, 2.2250738585072014e-308)
-        # Cap log(u) at -(2 ** -32) like sglang's multinomial_with_seed so a
-        # uniform of exactly 1 cannot produce +inf noise.
-        log_u = tl.minimum(tl.log(u), -2.3283064365386963e-10)
-        gumbel = -tl.log(-log_u)
+        gumbel = _gumbel_from_hash(h)
         weights = tl.load(
             logprobs + row * logprobs_stride_b + offsets * logprobs_stride_k,
             mask=mask,
