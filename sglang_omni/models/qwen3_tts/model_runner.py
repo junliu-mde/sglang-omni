@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -12,8 +13,34 @@ from sglang.srt.sampling.penaltylib import BatchedRepetitionPenalizer
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.sglang_execution import attn_forward_context
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
-from sglang_omni.scheduling.types import RequestOutput
+from sglang_omni.scheduling.types import (
+    PRECOMMITTED_PENALTY_CUMULATE_ATTR,
+    PrecommittedPenaltyCumulate,
+    RequestOutput,
+)
 
+
+
+
+@dataclass
+class _Qwen3TTSDecodeLaunch:
+    """Device snapshots owned by one asynchronous Qwen3-TTS decode step."""
+
+    code_snapshot: torch.Tensor
+    feedback_snapshot: torch.Tensor
+    feedback_rows: tuple[torch.Tensor, ...]
+
+
+@dataclass(frozen=True)
+class _LookaheadRepetitionToken:
+    """One staged semantic id pending host output finalization."""
+
+    result: Any
+    row_index: int
+
+
+_LOOKAHEAD_REPETITION_TOKEN_ATTR = "_omni_lookahead_repetition_token"
+_LOOKAHEAD_REPETITION_SYNC_FALLBACK_ATTR = "_omni_lookahead_repetition_sync_fallback"
 
 class Qwen3TTSModelRunner(ModelRunner):
     """Runs Qwen3-TTS AR steps and stores generated codec frames per request."""
@@ -22,6 +49,54 @@ class Qwen3TTSModelRunner(ModelRunner):
         super().__init__(tp_worker, output_processor)
         self._has_pending_code_step = False
         self._row_ids_cache: torch.Tensor | None = None
+
+    def _prepare_and_forward(
+        self,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+        is_prefill: bool,
+        *,
+        is_lookahead: bool = False,
+    ) -> Any:
+        """Start the semantic-id DtoH copy before Predictor GPU work.
+
+        Qwen3-TTS samples the semantic id before its Predictor pass. Staging it
+        here lets the dedicated copy stream transfer the id while the Predictor
+        computes codec ids and feedback on the decode stream.
+        """
+
+        result = super()._prepare_and_forward(
+            forward_batch,
+            schedule_batch,
+            requests,
+            is_prefill,
+            is_lookahead=is_lookahead,
+        )
+        token_ids = result.next_token_ids
+        if isinstance(token_ids, torch.Tensor) and token_ids.is_cuda:
+            self._stage_token_ids(result, token_ids)
+        return result
+
+    def _ensure_next_token_ids(
+        self,
+        batch_result: Any,
+        forward_batch: Any,
+        schedule_batch: Any,
+        scheduler_output: Any,
+    ) -> None:
+        """Cover any future path that materializes ids after the post hook."""
+
+        super()._ensure_next_token_ids(
+            batch_result,
+            forward_batch,
+            schedule_batch,
+            scheduler_output,
+        )
+        token_ids = batch_result.next_token_ids
+        if isinstance(token_ids, torch.Tensor) and token_ids.is_cuda:
+            self._stage_token_ids(batch_result, token_ids)
+
 
     def _execution_context(
         self,
@@ -88,6 +163,134 @@ class Qwen3TTSModelRunner(ModelRunner):
         requests: list,
     ) -> None:
         self._collect_codes(result, forward_batch, schedule_batch, requests)
+        self._clear_lookahead_repetition_sync_fallbacks(requests)
+
+    def lookahead_eligible(self, batch: Any) -> bool:
+        """Use lookahead when Qwen can commit its sampling state on device."""
+
+        # ``batch.reqs`` contains SGLang's raw ``Req`` objects. Omni request
+        # data is attached at admission under the private attribute, while the
+        # ``SchedulerRequest.data`` wrapper exists only after launch. A missing
+        # value must stay on the synchronous path because lookahead does not
+        # preserve the normal logprob collection order.
+        for req in batch.reqs:
+            data = getattr(req, "_omni_data", None)
+            if data is None or getattr(data, "return_logprob", True):
+                return False
+            if getattr(req, _LOOKAHEAD_REPETITION_SYNC_FALLBACK_ATTR, False):
+                return False
+        return True
+
+    def commit_lookahead_sampling_state(
+        self,
+        result: Any,
+        schedule_batch: Any,
+        scheduler_sampling_info: Any,
+        requests: list,
+    ) -> None:
+        """Commit this step's semantic ids before the next lookahead launch.
+
+        SGLang normally updates penalty state in
+        ``ScheduleBatch.prepare_for_decode`` from host ``Req.output_ids``.
+        During lookahead that list is one step late. The sampled semantic ids
+        already reside on the decode stream, so update the original scheduler
+        state there and tell ``OmniScheduler`` to skip exactly one later
+        host-history update. This keeps repetition, frequency, presence, and
+        minimum-new-token state identical to the synchronous sequence.
+        """
+
+        del requests
+        if scheduler_sampling_info is None:
+            return
+        orchestrator = getattr(scheduler_sampling_info, "penalizer_orchestrator", None)
+        if orchestrator is None or not orchestrator.is_required:
+            return
+        token_ids = result.next_token_ids
+        if not isinstance(token_ids, torch.Tensor) or token_ids.ndim != 1:
+            raise RuntimeError(
+                "Qwen3-TTS lookahead requires one device semantic id per request"
+            )
+        batch_size = len(schedule_batch.reqs)
+        if token_ids.shape[0] < batch_size:
+            raise RuntimeError(
+                "Qwen3-TTS lookahead semantic-id batch is smaller than the "
+                "scheduler batch"
+            )
+        orchestrator.cumulate_output_tokens(token_ids[:batch_size])
+        self._stage_lookahead_repetition_tokens(
+            result,
+            schedule_batch.reqs,
+        )
+        precommitted_requests = tuple(
+            req
+            for req in schedule_batch.reqs
+            if self._uses_output_history_penalty(req.sampling_params)
+        )
+        if not precommitted_requests:
+            raise RuntimeError(
+                "Qwen3-TTS committed penalty state without a matching sampling "
+                "parameter"
+            )
+        setattr(
+            schedule_batch,
+            PRECOMMITTED_PENALTY_CUMULATE_ATTR,
+            PrecommittedPenaltyCumulate(precommitted_requests),
+        )
+
+    @staticmethod
+    def _uses_output_history_penalty(sampling_params: Any) -> bool:
+        """Match every SGLang penalty that reads the newest output token."""
+
+        return (
+            getattr(sampling_params, "repetition_penalty", 1.0) != 1.0
+            or getattr(sampling_params, "frequency_penalty", 0.0) != 0.0
+            or getattr(sampling_params, "presence_penalty", 0.0) != 0.0
+            or getattr(sampling_params, "min_new_tokens", 0) > 0
+        )
+
+    @staticmethod
+    def _stage_lookahead_repetition_tokens(
+        result: Any,
+        reqs: list,
+    ) -> None:
+        """Keep the staged semantic id missing from Qwen's host penalty.
+
+        SGLang's penalizer state is committed on device above. Qwen also has a
+        legacy repetition-penalty pass that reads ``Req.output_ids`` directly.
+        In a lookahead launch that list is one token behind, so retain the
+        already-started pinned DtoH snapshot keyed by the raw request. The next
+        launch reads it only after enqueuing its Talker forward, so any wait can
+        overlap GPU work. Resolve clears the record after the normal host output
+        append catches up.
+        """
+
+        if not any(req.sampling_params.repetition_penalty != 1.0 for req in reqs):
+            return
+        if not isinstance(getattr(result, "_host_token_ids", None), torch.Tensor):
+            # A CUDA Graph capture cannot enqueue the cross-stream DtoH copy.
+            # The next scheduler iteration must drain this step and run one
+            # normal decode, where Req.output_ids has caught up. This preserves
+            # the legacy host repetition pass without doing capture-unsafe work.
+            for req in reqs:
+                if req.sampling_params.repetition_penalty != 1.0:
+                    setattr(req, _LOOKAHEAD_REPETITION_SYNC_FALLBACK_ATTR, True)
+            return
+        for row_index, req in enumerate(reqs):
+            if req.sampling_params.repetition_penalty != 1.0:
+                setattr(
+                    req,
+                    _LOOKAHEAD_REPETITION_TOKEN_ATTR,
+                    _LookaheadRepetitionToken(result, row_index),
+                )
+
+    @staticmethod
+    def _clear_lookahead_repetition_sync_fallbacks(requests: list) -> None:
+        """Re-enable lookahead after the required synchronous decode completes."""
+
+        for sched_req in requests:
+            req = sched_req.data.req
+            if getattr(req, _LOOKAHEAD_REPETITION_SYNC_FALLBACK_ATTR, False):
+                delattr(req, _LOOKAHEAD_REPETITION_SYNC_FALLBACK_ATTR)
 
     def sample_before_post_prefill(
         self, forward_batch: Any, schedule_batch: Any, requests: list
@@ -237,6 +440,76 @@ class Qwen3TTSModelRunner(ModelRunner):
         # blocking pageable copy inside the decode loop.
         self._stage_token_ids(result, result.next_token_ids)
         self._has_pending_code_step = True
+
+    def post_decode_launch(
+        self,
+        result: Any,
+        forward_batch: Any,
+        requests: list,
+    ) -> _Qwen3TTSDecodeLaunch | None:
+        """Run Predictor before resolve and publish its feedback for lookahead.
+
+        The next decode launch consumes this step's Predictor feedback before
+        the scheduler resolves the semantic id on the host. The Predictor owns
+        reusable output buffers, so retain private device snapshots for the
+        later resolve/output phase.
+        """
+
+        if not requests:
+            return None
+        if result.next_token_ids is None:
+            result.next_token_ids = self._sample_next_token_ids(
+                result.logits_output,
+                forward_batch,
+                None,
+                requests,
+            )
+        token_ids = result.next_token_ids
+        if isinstance(token_ids, torch.Tensor) and token_ids.is_cuda:
+            self._stage_token_ids(result, token_ids)
+        self._collect_codes(result, forward_batch, None, requests)
+        if not getattr(result, "_qwen3_tts_has_code_step", False):
+            return None
+
+        batch_size = len(requests)
+        code_snapshot = self.model._output_codes[:batch_size].detach().clone()
+        feedback_snapshot = self.model._output_embeds[:batch_size].detach().clone()
+        # Keep the exact row views that enter the request queues. A new view of
+        # the same tensor would not compare by identity when an EOS row must be
+        # removed during resolve.
+        feedback_rows = tuple(
+            feedback_snapshot[row_idx] for row_idx in range(batch_size)
+        )
+        for row_idx, sched_req in enumerate(requests):
+            sched_req.data.pending_feedback_queue.append(feedback_rows[row_idx])
+
+        result._qwen3_tts_code_snapshot = code_snapshot
+        result._qwen3_tts_feedback_snapshot = feedback_snapshot
+        result._qwen3_tts_feedback_rows = feedback_rows
+        result._qwen3_tts_feedback_prepublished = True
+        return _Qwen3TTSDecodeLaunch(
+            code_snapshot=code_snapshot,
+            feedback_snapshot=feedback_snapshot,
+            feedback_rows=feedback_rows,
+        )
+
+    def post_decode_resolve(
+        self,
+        launch_buf: _Qwen3TTSDecodeLaunch | None,
+        result: Any,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+    ) -> None:
+        """Restore launch-owned snapshots after the lookahead completion event."""
+
+        del forward_batch, schedule_batch, requests
+        if launch_buf is None:
+            return
+        result._qwen3_tts_code_snapshot = launch_buf.code_snapshot
+        result._qwen3_tts_feedback_snapshot = launch_buf.feedback_snapshot
+        result._qwen3_tts_feedback_rows = launch_buf.feedback_rows
+        result._qwen3_tts_feedback_prepublished = True
 
     def post_process_outputs(
         self,
