@@ -612,8 +612,12 @@ class OmniScheduler:
         )
         from sglang.srt.runtime_context import get_parallel
 
+        # Prefer the Omni-bound custom runner when present. __init__ may call
+        # bind_model_runner before this component install, so the adapter must
+        # not stay pinned to tp_worker.model_runner alone.
+        adapter_runner = self._model_runner or self.tp_worker.model_runner
         self.dp_attn_adapter = SchedulerDPAttnAdapter(
-            model_runner=self.tp_worker.model_runner,
+            model_runner=adapter_runner,
             tp_group=self.tp_group,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
