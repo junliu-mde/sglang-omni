@@ -44,11 +44,15 @@ if triton is not None:
 
     @triton.jit
     def _gumbel_from_hash(h: tl.uint32):
-        """Match SGLang multinomial_with_seed float64 endpoint handling."""
+        """Match SGLang multinomial_with_seed float64 endpoint handling.
+
+        SGLang does ``x.log_().clamp_(min=finfo.min, max=-(2**-32)).neg_().log_().neg_()``.
+        Clamp after log so hash 0 becomes finfo.min, not a tiny positive u.
+        """
         u = h.to(tl.float64) / 4294967295.0
-        u = tl.maximum(u, 2.2250738585072014e-308)
-        # Cap log(u) at -(2 ** -32) so a uniform of exactly 1 cannot produce +inf.
-        log_u = tl.minimum(tl.log(u), -2.3283064365386963e-10)
+        log_u = tl.log(u)
+        log_u = tl.maximum(log_u, -1.7976931348623157e308)
+        log_u = tl.minimum(log_u, -2.3283064365386963e-10)
         return -tl.log(-log_u)
 
     @triton.jit
