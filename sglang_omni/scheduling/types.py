@@ -19,22 +19,6 @@ class SchedulerStatus(Enum):
     ABORTED = auto()
 
 
-PRECOMMITTED_PENALTY_CUMULATE_ATTR = "_omni_precommitted_penalty_cumulate"
-
-
-@dataclass(frozen=True)
-class PrecommittedPenaltyCumulate:
-    """Rows whose newest penalty token was committed on the decode stream."""
-
-    request_refs: tuple[object, ...]
-
-    def contains(self, request: object) -> bool:
-        """Return whether ``request`` is one of the device-committed rows."""
-
-        return any(request is precommitted for precommitted in self.request_refs)
-
-
-
 @dataclass
 class SchedulerRequest:
     request_id: str

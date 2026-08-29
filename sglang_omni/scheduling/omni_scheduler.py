@@ -20,7 +20,6 @@ import time
 import types
 from array import array
 from collections import deque
-import contextlib
 from concurrent.futures import Future, ThreadPoolExecutor
 from itertools import islice
 from typing import Any, Callable
@@ -62,11 +61,7 @@ from sglang_omni.proto.admin import (
     ADMIN_WEIGHTS_CHECKER,
 )
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
-from sglang_omni.scheduling.types import (
-    DeferredAdmission,
-    PRECOMMITTED_PENALTY_CUMULATE_ATTR,
-    PrecommittedPenaltyCumulate,
-)
+from sglang_omni.scheduling.types import DeferredAdmission
 
 logger = logging.getLogger(__name__)
 
@@ -1327,10 +1322,9 @@ class OmniScheduler:
         own that state, so feed it in and write the (possibly rebuilt) running
         batch back before handing the runnable batch to the caller.
         """
-        with self._skip_precommitted_penalty_cumulate():
-            plan = _Upstream.get_next_batch_to_run(
+        plan = _Upstream.get_next_batch_to_run(
             self, self.running_batch, self.last_batch
-            )
+        )
         self.running_batch = plan.running_batch
         return plan.batch_to_run
 
@@ -2490,177 +2484,6 @@ class OmniScheduler:
             kept_ids = {id(r) for r in batch.reqs}
             batch.decoding_reqs = [r for r in batch.decoding_reqs if id(r) in kept_ids]
         return batch if batch.reqs else None
-
-    @contextlib.contextmanager
-    def _skip_precommitted_penalty_cumulate(self):
-        """Replace one host-history update after an async device commit.
-
-        Qwen3-TTS commits the semantic id on the decode stream before the next
-        scheduler iteration. SGLang 0.5.16 exposes no prepare-time handoff for
-        that token, so shadow the current batch's method only while upstream
-        schedules it. New rows can merge before this decode preparation. Their
-        host token must still enter the penalty state, so the wrapper restores
-        only rows that were already committed on the device. It consumes the
-        marker only if upstream actually prepares a decode batch.
-        """
-
-        batch = self.running_batch
-        marker = (
-            None
-            if batch is None
-            else getattr(batch, PRECOMMITTED_PENALTY_CUMULATE_ATTR, None)
-        )
-        if marker is None:
-            yield
-            return
-        if not isinstance(marker, PrecommittedPenaltyCumulate):
-            raise RuntimeError("Invalid async penalty handoff state")
-
-        if not self._precommitted_penalty_rows(batch, marker):
-            # The rows that needed the skip have all finished or retracted.
-            # A later merged request must never inherit this handoff.
-            delattr(batch, PRECOMMITTED_PENALTY_CUMULATE_ATTR)
-            yield
-            return
-
-        method_name = "cumulate_penalty_output_tokens"
-        try:
-            instance_values = vars(batch)
-        except TypeError:
-            instance_values = None
-        had_instance_method = (
-            instance_values is not None and method_name in instance_values
-        )
-        previous_instance_method = (
-            instance_values[method_name] if had_instance_method else None
-        )
-        original_method = getattr(batch, method_name)
-        consumed = False
-
-        def cumulate_once() -> None:
-            nonlocal consumed
-            if consumed:
-                raise RuntimeError(
-                    "SGLang invoked the async penalty handoff more than once"
-                )
-            # ``get_next_batch_to_run`` filters finished rows before it calls
-            # ``prepare_for_decode``. Resolve their current positions here, not
-            # before entering upstream scheduling, or a surviving row can shift.
-            precommitted_rows = self._precommitted_penalty_rows(batch, marker)
-            if not precommitted_rows:
-                original_method()
-            elif len(precommitted_rows) < len(batch.reqs):
-                snapshots = self._snapshot_precommitted_penalty_rows(
-                    batch,
-                    precommitted_rows,
-                )
-                try:
-                    original_method()
-                finally:
-                    self._restore_precommitted_penalty_rows(snapshots)
-            consumed = True
-
-        try:
-            setattr(batch, method_name, cumulate_once)
-        except (AttributeError, TypeError) as exc:
-            raise RuntimeError(
-                "SGLang ScheduleBatch does not permit the async penalty handoff"
-            ) from exc
-        try:
-            yield
-        finally:
-            if had_instance_method:
-                setattr(batch, method_name, previous_instance_method)
-            else:
-                delattr(batch, method_name)
-            if (
-                consumed or not self._precommitted_penalty_rows(batch, marker)
-            ) and getattr(batch, PRECOMMITTED_PENALTY_CUMULATE_ATTR, None) is marker:
-                delattr(batch, PRECOMMITTED_PENALTY_CUMULATE_ATTR)
-
-    @staticmethod
-    def _precommitted_penalty_rows(
-        batch: Any,
-        marker: PrecommittedPenaltyCumulate,
-    ) -> list[int]:
-        """Resolve device-committed requests to their current batch rows."""
-
-        return [
-            row_index
-            for row_index, req in enumerate(batch.reqs)
-            if marker.contains(req)
-        ]
-
-    @staticmethod
-    def _snapshot_precommitted_penalty_rows(
-        batch: Any,
-        row_indices: list[int],
-    ) -> list[tuple[Any, str, torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Snapshot row-indexed upstream penalty tensors before host cumulation.
-
-        SGLang's penalty API updates every batch row at once. A precommitted
-        batch can gain a new row before decode preparation, so the scheduler
-        must let the new row advance while preserving the device-committed rows.
-        The upstream penalizers keep all mutable per-row state in tensors whose
-        first dimension is the current batch size.
-        """
-
-        orchestrator = getattr(
-            getattr(batch, "sampling_info", None),
-            "penalizer_orchestrator",
-            None,
-        )
-        penalizers = getattr(orchestrator, "penalizers", None)
-        if not isinstance(penalizers, dict):
-            raise RuntimeError(
-                "SGLang penalizer state is unavailable for the async penalty handoff"
-            )
-
-        batch_size = len(batch.reqs)
-        snapshots = []
-        for penalizer in penalizers.values():
-            try:
-                attributes = vars(penalizer).items()
-            except TypeError as exc:
-                raise RuntimeError(
-                    "SGLang penalizer state is not inspectable for the async "
-                    "penalty handoff"
-                ) from exc
-            for attribute, value in attributes:
-                if (
-                    not isinstance(value, torch.Tensor)
-                    or value.ndim == 0
-                    or value.shape[0] != batch_size
-                ):
-                    continue
-                indices = torch.tensor(
-                    row_indices,
-                    dtype=torch.long,
-                    device=value.device,
-                )
-                snapshots.append(
-                    (penalizer, attribute, value, indices, value[indices].clone())
-                )
-        if not snapshots:
-            raise RuntimeError(
-                "SGLang penalizer exposes no row state for the async penalty handoff"
-            )
-        return snapshots
-
-    @staticmethod
-    def _restore_precommitted_penalty_rows(
-        snapshots: list[tuple[Any, str, torch.Tensor, torch.Tensor, torch.Tensor]],
-    ) -> None:
-        """Restore device-committed penalty rows after upstream host cumulation."""
-
-        for penalizer, attribute, original, indices, saved in snapshots:
-            current = getattr(penalizer, attribute, None)
-            if not isinstance(current, torch.Tensor) or current.shape != original.shape:
-                raise RuntimeError(
-                    "SGLang penalizer changed row state during the async penalty "
-                    "handoff"
-                )
-            current.index_copy_(0, indices, saved)
 
     def _event_loop_async_decode(self) -> None:
         """One-step-lookahead decode loop (single stream + CUDA event).
