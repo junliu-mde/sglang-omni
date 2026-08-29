@@ -78,6 +78,7 @@ def test_seeded_small_k_sampler_matches_sglang_at_the_uint32_max_hash() -> None:
     assert expected_rank.item() == 1
     assert sampled.tolist() == [9]
 
+
 @pytest.mark.parametrize(
     ("seed_value", "other_logprob", "endpoint_logprob"),
     [
@@ -137,7 +138,6 @@ def test_seeded_small_k_sampler_matches_reference_at_hash_endpoints(
     assert torch.equal(actual, expected)
 
 
-
 def test_fused_raw_logit_sampler_matches_reference_at_uint32_max_hash() -> None:
     """The raw-logit graph kernel must match SGLang multinomial at hash endpoints."""
     max_top_k = 50
@@ -174,7 +174,6 @@ def test_fused_raw_logit_sampler_matches_reference_at_uint32_max_hash() -> None:
 
     assert actual is not None
     assert torch.equal(actual, expected)
-
 
 
 def test_seeded_small_k_sampler_falls_back_for_cpu() -> None:

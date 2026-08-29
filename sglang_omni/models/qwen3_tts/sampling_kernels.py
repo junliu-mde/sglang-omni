@@ -110,10 +110,13 @@ if triton is not None:
     ):
         """One compare-exchange round of PyTorch's small descending sort.
 
+        Under the repository's ``torch==2.13.0`` pin,
         ``torch.topk(..., sorted=True)`` first gathers the selected entries and
         then uses this unstable 32-entry bitonic network for k <= 32. The
         equality behavior is observable by the seeded sampler, so a regular
-        lexicographic sort would not be a compatible replacement.
+        lexicographic sort would not be a compatible replacement. The CUDA
+        parity tests compare this network with ``torch.topk`` so a PyTorch
+        upgrade fails before this implementation can silently diverge.
         """
         partner_offsets = offsets ^ stride
         partner_scores = tl.gather(scores, partner_offsets, axis=0)

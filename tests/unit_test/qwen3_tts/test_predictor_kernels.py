@@ -11,7 +11,6 @@ from sglang_omni.models.qwen3_tts.predictor_kernels import (
     gather_codec_embedding_and_add,
 )
 
-
 _HAS_CUDA = torch.cuda.is_available()
 
 
