@@ -2178,11 +2178,10 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
         assert scheduler.dp_attn_adapter.model_runner is model_runner
 
 
-@pytest.mark.parametrize("frozen", [False, True], ids=["mutable", "frozen"])
-def test_bind_model_runner_updates_versioned_dp_adapter(monkeypatch, frozen) -> None:
-    """Late binding mutates old adapters and replaces frozen adapters."""
+def test_bind_model_runner_replaces_frozen_dp_adapter(monkeypatch) -> None:
+    """Late binding replaces SGLang's pinned frozen adapter."""
 
-    @dataclass(frozen=frozen)
+    @dataclass(frozen=True)
     class _DPAttnAdapter:
         model_runner: object
         preserved: object
@@ -2217,11 +2216,8 @@ def test_bind_model_runner_updates_versioned_dp_adapter(monkeypatch, frozen) -> 
     )
     scheduler.bind_model_runner(model_runner)
 
-    if frozen:
-        assert scheduler.dp_attn_adapter is not original_adapter
-        assert original_adapter.model_runner is old_runner
-    else:
-        assert scheduler.dp_attn_adapter is original_adapter
+    assert scheduler.dp_attn_adapter is not original_adapter
+    assert original_adapter.model_runner is old_runner
     assert scheduler.dp_attn_adapter.model_runner is model_runner
     assert scheduler.dp_attn_adapter.preserved is preserved
     assert observed == [scheduler._execution_bridge]

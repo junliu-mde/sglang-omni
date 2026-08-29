@@ -530,16 +530,8 @@ class OmniScheduler:
         # but make the custom ModelRunner the sole owner of relay.
         self._model_runner = model_runner
         dp_attn_adapter = self.__dict__.get("dp_attn_adapter")
-        if dp_attn_adapter is not None and hasattr(dp_attn_adapter, "model_runner"):
-            dataclass_params = getattr(
-                type(dp_attn_adapter), "__dataclass_params__", None
-            )
-            if dataclass_params is not None and dataclass_params.frozen:
-                self.dp_attn_adapter = replace(
-                    dp_attn_adapter, model_runner=model_runner
-                )
-            else:
-                dp_attn_adapter.model_runner = model_runner
+        if dp_attn_adapter is not None:
+            self.dp_attn_adapter = replace(dp_attn_adapter, model_runner=model_runner)
         self._execution_bridge = bridge
         self.future_map = bridge.future_map
 
