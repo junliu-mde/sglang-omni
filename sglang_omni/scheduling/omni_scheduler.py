@@ -552,11 +552,6 @@ class OmniScheduler:
         )
         # High-water mark, not a cap. Mirrors upstream Scheduler.__init__ (sglang/srt/managers/scheduler.py).
         self.max_prefill_bs = 0
-        # SGLang 0.5.17's borrowed result processor updates these counters.
-        self.total_prefill_uncached_tokens = 0
-        self.total_prefill_busy_us = 0
-        self.decode_moment_totals: list[float] = [0.0] * 6
-        self._prev_decode_launch_ts: float | None = None
         self.use_ngram_embedding = False
         self.return_health_check_ipcs = []
         self.enable_overlap_mlx = False
