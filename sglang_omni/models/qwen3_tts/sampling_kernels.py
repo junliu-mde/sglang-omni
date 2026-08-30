@@ -309,7 +309,8 @@ if triton is not None:
         temperature = tl.maximum(tl.load(temperatures + row).to(tl.float32), 1e-5)
         scores = scores / temperature
 
-        # PyTorch's top-k gather chooses lower input indices at its threshold.
+        # Note (Jun Liu): PyTorch's top-k gather chooses lower input indices at
+        # its threshold.
         # The packed order is score descending, then index ascending. We unpack
         # the selected FP32 score exactly rather than reloading it from logits.
         score_bits = scores.to(tl.uint32, bitcast=True)
@@ -342,7 +343,8 @@ if triton is not None:
         ).to(tl.uint32)
 
         if max_top_k <= 32:
-            # gatherTopK first writes every score strictly above the threshold
+            # Note (Jun Liu): gatherTopK first writes every score strictly above
+            # the threshold
             # in source-index order. It then appends threshold-equal scores in
             # source-index order. Its following 32-entry bitonic sort is
             # unstable, so reproducing only the final top-k membership is not
@@ -351,7 +353,8 @@ if triton is not None:
                 tl.where(ranks == max_top_k - 1, ordered_top_score_bits, 0),
                 axis=0,
             )
-            # CUDA's threshold gather compares the float rank representation.
+            # Note (Jun Liu): CUDA's threshold gather compares the float rank
+            # representation.
             # In particular, it selects positive zero ahead of negative zero.
             # A numerical score comparison would collapse that distinction and
             # could change the seeded codec ID.
@@ -365,7 +368,8 @@ if triton is not None:
                 ).to(tl.uint64)
                 << 32
             ) | vocab_offsets.to(tl.uint64)
-            # ``tl.topk`` only supports descending selection. Complementing
+            # Note (Jun Liu): ``tl.topk`` only supports descending selection.
+            # Complementing
             # the unsigned key turns its descending order into the ascending
             # gather order used by PyTorch's top-k implementation.
             all_ones_key = (all_ones_vocab.to(tl.uint64) << 32) | all_ones_vocab.to(
@@ -495,7 +499,8 @@ def _fused_raw_logit_block_k(max_top_k: int) -> int | None:
     if max_top_k not in _FUSED_RAW_LOGIT_TOP_KS:
         return None
     if max_top_k <= 32:
-        # PyTorch uses a fixed 32-entry bitonic network for all these widths.
+        # Note (Jun Liu): PyTorch uses a fixed 32-entry bitonic network for all
+        # these widths.
         return 32
     return _next_power_of_2(max_top_k)
 

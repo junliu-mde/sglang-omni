@@ -11,8 +11,6 @@ from sglang_omni.models.qwen3_tts.predictor_kernels import (
     gather_codec_embedding_and_add,
 )
 
-_HAS_CUDA = torch.cuda.is_available()
-
 
 def test_gather_codec_embedding_and_add_cpu_falls_back_without_writes():
     token_ids = torch.tensor([1, 3], dtype=torch.long)
@@ -32,11 +30,13 @@ def test_gather_codec_embedding_and_add_cpu_falls_back_without_writes():
     assert torch.equal(accumulated, expected_accumulated)
 
 
-@pytest.mark.skipif(not _HAS_CUDA, reason="Triton predictor kernel needs CUDA")
+@pytest.mark.accelerator
 @pytest.mark.parametrize("invalid_input", ["dtype", "layout", "overlap"])
 def test_gather_codec_embedding_and_add_rejects_unsafe_input_without_writes(
     invalid_input: str,
 ):
+    if not torch.cuda.is_available():
+        pytest.skip("Triton predictor kernel needs CUDA")
     device = torch.device("cuda")
     token_ids = torch.tensor([1, 3], dtype=torch.long, device=device)
     embedding_weight = torch.randn(8, 8, dtype=torch.bfloat16, device=device)
@@ -64,7 +64,7 @@ def test_gather_codec_embedding_and_add_rejects_unsafe_input_without_writes(
     assert torch.equal(accumulated, expected_accumulated)
 
 
-@pytest.mark.skipif(not _HAS_CUDA, reason="Triton predictor kernel needs CUDA")
+@pytest.mark.accelerator
 @pytest.mark.parametrize(
     ("batch_size", "hidden_size"),
     [(1, 8), (4, 8), (8, 2048)],
@@ -73,6 +73,8 @@ def test_gather_codec_embedding_and_add_matches_bf16_reference(
     batch_size: int,
     hidden_size: int,
 ):
+    if not torch.cuda.is_available():
+        pytest.skip("Triton predictor kernel needs CUDA")
     device = torch.device("cuda")
     generator = torch.Generator(device="cpu").manual_seed(
         batch_size * 10000 + hidden_size

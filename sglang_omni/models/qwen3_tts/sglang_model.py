@@ -1367,7 +1367,8 @@ class Qwen3TTSTalker(nn.Module):
         embedding_buffer = getattr(self, "_predictor_embedding_buffer", None)
         if embedding_buffer is not None:
             embedding_buffer = embedding_buffer[:batch_size]
-        # Capture P2 into a graph; standalone Triton launch loses to ATen.
+        # Note (Jun Liu): Capture P2 into a graph; a standalone Triton launch
+        # loses to ATen.
         use_fused_embedding = (
             embedding_buffer is not None
             and layer0_codes.is_cuda
@@ -1584,9 +1585,9 @@ class Qwen3TTSTalker(nn.Module):
             + 1
         )
 
-        # The raw-logit fusion has a favorable launch-count tradeoff only in
-        # the predictor CUDA graph. The eager path keeps the mature ATen
-        # sequence, including all of its shape coverage.
+        # Note (Jun Liu): The raw-logit fusion has a favorable launch-count
+        # tradeoff only in the predictor CUDA graph. The eager path keeps the
+        # mature ATen sequence, including all of its shape coverage.
         if logits.is_cuda and torch.cuda.is_current_stream_capturing():
             fused_sampled = sample_from_logits_with_seed_top_k_top_p(
                 logits,
@@ -1722,8 +1723,8 @@ class Qwen3TTSTalker(nn.Module):
         )
         if use_fused_addmm:
             residual_2d = residual.reshape(attn_input.shape[0], weight.shape[0])
-            # The caller replaces ``residual`` immediately after this call.
-            # Reuse its storage so addmm's beta term needs no separate copy.
+            # Note (Jun Liu): The caller replaces ``residual`` immediately after
+            # this call. Reuse its storage so addmm's beta term needs no copy.
             torch.addmm(
                 residual_2d,
                 attn_input,
